@@ -11,7 +11,7 @@ app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const APP_VERSION = "compact-response-v2";
+const APP_VERSION = "bidzaar-parser-v3";
 
 const PROXY_KEY = process.env.PROXY_KEY;
 const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
@@ -44,6 +44,7 @@ function requireProxyKey(req, res, next) {
   if (!PROXY_KEY) {
     return res.status(500).json({
       ok: false,
+      version: APP_VERSION,
       error: "PROXY_KEY is not configured",
     });
   }
@@ -53,6 +54,7 @@ function requireProxyKey(req, res, next) {
   if (key !== PROXY_KEY) {
     return res.status(401).json({
       ok: false,
+      version: APP_VERSION,
       error: "Unauthorized",
     });
   }
@@ -111,27 +113,35 @@ function toTimestampMs(value) {
 
   const raw = String(value).trim();
 
-  const match = raw.match(
+  const ruMatch = raw.match(
     /(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})(?:\s+(\d{1,2}):(\d{2}))?/,
   );
 
-  if (!match) return null;
+  if (ruMatch) {
+    const [, dd, mm, yyyy, hh = "18", min = "00"] = ruMatch;
 
-  const [, dd, mm, yyyy, hh = "18", min = "00"] = match;
+    const date = new Date(
+      Number(yyyy),
+      Number(mm) - 1,
+      Number(dd),
+      Number(hh),
+      Number(min),
+      0,
+      0,
+    );
 
-  const date = new Date(
-    Number(yyyy),
-    Number(mm) - 1,
-    Number(dd),
-    Number(hh),
-    Number(min),
-    0,
-    0,
-  );
+    if (!Number.isNaN(date.getTime())) {
+      return date.getTime();
+    }
+  }
 
-  if (Number.isNaN(date.getTime())) return null;
+  const parsed = Date.parse(raw);
 
-  return date.getTime();
+  if (!Number.isNaN(parsed)) {
+    return parsed;
+  }
+
+  return null;
 }
 
 function makeDeadline(deadlineValue) {
@@ -324,8 +334,300 @@ function getCreatedTaskId(createdResponse) {
   );
 }
 
+function isObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function flattenJson(value, result = [], depth = 0) {
+  if (depth > 8) return result;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      flattenJson(item, result, depth + 1);
+    }
+
+    return result;
+  }
+
+  if (isObject(value)) {
+    result.push(value);
+
+    for (const item of Object.values(value)) {
+      flattenJson(item, result, depth + 1);
+    }
+  }
+
+  return result;
+}
+
+function pickFirstString(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+
+    if (typeof value === "number") {
+      return String(value);
+    }
+  }
+
+  return null;
+}
+
+function pickFirstNumber(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+
+    if (typeof value === "number") {
+      return value;
+    }
+
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+      return Number(value.trim());
+    }
+  }
+
+  return null;
+}
+
+function looksLikeDeadline(value) {
+  if (!value) return false;
+
+  const raw = String(value);
+
+  return (
+    /\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}/.test(raw) ||
+    /\d{4}-\d{2}-\d{2}/.test(raw) ||
+    /T\d{2}:\d{2}/.test(raw)
+  );
+}
+
+function normalizeDocUrl(url, sourceUrl) {
+  if (!url) return null;
+
+  try {
+    return new URL(url, sourceUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractDocumentsFromJsonObjects(objects, sourceUrl) {
+  const docs = [];
+  const seen = new Set();
+
+  const urlKeys = [
+    "url",
+    "href",
+    "downloadUrl",
+    "fileUrl",
+    "link",
+    "src",
+    "path",
+    "uri",
+  ];
+
+  const nameKeys = [
+    "name",
+    "title",
+    "fileName",
+    "filename",
+    "originalName",
+    "displayName",
+    "label",
+  ];
+
+  for (const obj of objects) {
+    const maybeType = String(
+      obj.type || obj.kind || obj.contentType || obj.mimeType || "",
+    ).toLowerCase();
+
+    const maybeName = pickFirstString(obj, nameKeys);
+    const maybeUrl = pickFirstString(obj, urlKeys);
+
+    const lowerName = String(maybeName || "").toLowerCase();
+    const lowerUrl = String(maybeUrl || "").toLowerCase();
+
+    const looksLikeFile =
+      lowerName.includes(".doc") ||
+      lowerName.includes(".docx") ||
+      lowerName.includes(".xls") ||
+      lowerName.includes(".xlsx") ||
+      lowerName.includes(".pdf") ||
+      lowerName.includes(".zip") ||
+      lowerUrl.includes(".doc") ||
+      lowerUrl.includes(".docx") ||
+      lowerUrl.includes(".xls") ||
+      lowerUrl.includes(".xlsx") ||
+      lowerUrl.includes(".pdf") ||
+      lowerUrl.includes(".zip") ||
+      lowerUrl.includes("download") ||
+      maybeType.includes("pdf") ||
+      maybeType.includes("word") ||
+      maybeType.includes("excel") ||
+      maybeType.includes("spreadsheet") ||
+      maybeType.includes("zip");
+
+    if (!maybeUrl || !looksLikeFile) continue;
+
+    const finalUrl = normalizeDocUrl(maybeUrl, sourceUrl);
+
+    if (!finalUrl) continue;
+
+    const finalName = normalizeDocumentName(
+      maybeName || getFilenameFromUrl(finalUrl, "Документ"),
+    );
+
+    const key = `${finalName}|${finalUrl}`;
+
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+
+    docs.push({
+      name: finalName,
+      url: finalUrl,
+    });
+  }
+
+  return docs;
+}
+
+function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
+  const allObjects = [];
+
+  for (const response of jsonResponses) {
+    flattenJson(response.json, allObjects);
+  }
+
+  let title = null;
+  let code = null;
+  let deadline = null;
+  let positionsCount = null;
+
+  const titleKeys = [
+    "title",
+    "name",
+    "subject",
+    "procedureName",
+    "processName",
+    "tenderName",
+    "lotName",
+  ];
+
+  const codeKeys = [
+    "code",
+    "number",
+    "procedureNumber",
+    "processNumber",
+    "tenderNumber",
+    "externalId",
+    "publicId",
+  ];
+
+  const deadlineKeys = [
+    "deadline",
+    "endDate",
+    "finishDate",
+    "endAt",
+    "finishedAt",
+    "submissionDeadline",
+    "applicationDeadline",
+    "dateEnd",
+    "bidEndDate",
+    "requestEndDate",
+  ];
+
+  const positionKeys = [
+    "positionsCount",
+    "itemsCount",
+    "lotsCount",
+    "quantity",
+    "count",
+  ];
+
+  for (const obj of allObjects) {
+    if (!title) {
+      const maybeTitle = pickFirstString(obj, titleKeys);
+
+      if (
+        maybeTitle &&
+        maybeTitle.length > 5 &&
+        !["bidzaar", "menu", "home"].includes(maybeTitle.toLowerCase())
+      ) {
+        title = maybeTitle;
+      }
+    }
+
+    if (!code) {
+      const maybeCode = pickFirstString(obj, codeKeys);
+
+      if (maybeCode && maybeCode.length <= 50) {
+        code = maybeCode;
+      }
+    }
+
+    if (!deadline) {
+      for (const key of deadlineKeys) {
+        const value = obj?.[key];
+
+        if (value && looksLikeDeadline(value)) {
+          deadline = String(value);
+          break;
+        }
+      }
+    }
+
+    if (!positionsCount) {
+      const maybeCount = pickFirstNumber(obj, positionKeys);
+
+      if (maybeCount && maybeCount > 0 && maybeCount < 100000) {
+        positionsCount = maybeCount;
+      }
+    }
+  }
+
+  const documents = extractDocumentsFromJsonObjects(allObjects, sourceUrl);
+
+  return {
+    title,
+    code,
+    deadline,
+    positionsCount,
+    documents,
+  };
+}
+
+function extractTenderFromText(text) {
+  const safeText = String(text || "");
+
+  const codeMatch =
+    safeText.match(/код[:\s№-]*([0-9]{2,}[-/][0-9]{2,})/i) ||
+    safeText.match(/№[:\s]*([0-9]{2,}[-/][0-9]{2,})/i);
+
+  const deadlineMatch =
+    safeText.match(
+      /(дата\s+окончания|дедлайн|окончание|срок\s+подачи)[^\d]{0,80}(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}(?:\s+\d{1,2}:\d{2})?)/i,
+    ) || safeText.match(/(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}\s+\d{1,2}:\d{2})/);
+
+  const positionsMatch =
+    safeText.match(/позици[ийя]{1,2}[^\d]{0,20}(\d+)/i) ||
+    safeText.match(/лотов[^\d]{0,20}(\d+)/i);
+
+  return {
+    code: codeMatch?.[1] || null,
+    deadline: deadlineMatch?.[2] || deadlineMatch?.[1] || null,
+    positionsCount: positionsMatch ? Number(positionsMatch[1]) : null,
+  };
+}
+
 async function parseBidzaarTenderPage(url) {
   let browser;
+
+  const jsonResponses = [];
+  const responseUrls = [];
 
   try {
     browser = await chromium.launch({
@@ -342,21 +644,63 @@ async function parseBidzaarTenderPage(url) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     });
 
+    page.on("response", async (response) => {
+      try {
+        const responseUrl = response.url();
+        const contentType = response.headers()["content-type"] || "";
+
+        const shouldTryJson =
+          contentType.includes("application/json") ||
+          responseUrl.includes("/api/") ||
+          responseUrl.includes("/graphql") ||
+          responseUrl.includes("process") ||
+          responseUrl.includes("procedure") ||
+          responseUrl.includes("tender");
+
+        if (!shouldTryJson) return;
+
+        const json = await response.json().catch(() => null);
+
+        if (!json) return;
+
+        responseUrls.push(responseUrl);
+
+        if (jsonResponses.length < 80) {
+          jsonResponses.push({
+            url: responseUrl,
+            json,
+          });
+        }
+      } catch {
+        // молча пропускаем не-JSON / закрытые ответы
+      }
+    });
+
     await page.goto(url, {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
       timeout: 90000,
     });
 
+    await page.waitForLoadState("networkidle", {
+      timeout: 45000,
+    }).catch(() => null);
+
+    await page.waitForTimeout(7000);
+
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => null);
+
     await page.waitForTimeout(3000);
 
-    const data = await page.evaluate(() => {
+    const domData = await page.evaluate(() => {
       const text = document.body?.innerText || "";
 
-      const title =
+      const pageTitle =
         document.querySelector("h1")?.innerText?.trim() ||
         document.querySelector("h2")?.innerText?.trim() ||
         document.title?.trim() ||
-        "Тендер Bidzaar";
+        "Bidzaar";
 
       const anchors = Array.from(document.querySelectorAll("a"));
 
@@ -394,44 +738,69 @@ async function parseBidzaarTenderPage(url) {
         });
 
       return {
-        title,
+        pageTitle,
         text,
         documents,
       };
     });
 
-    const text = data.text || "";
+    const textTender = extractTenderFromText(domData.text);
+    const jsonTender = extractTenderFromJsonResponses(jsonResponses, url);
 
-    const codeMatch =
-      text.match(/код[:\s№-]*([0-9]{2,}[-/][0-9]{2,})/i) ||
-      text.match(/№[:\s]*([0-9]{2,}[-/][0-9]{2,})/i);
+    const title =
+      jsonTender.title ||
+      (domData.pageTitle && domData.pageTitle !== "Bidzaar"
+        ? domData.pageTitle
+        : null) ||
+      "Bidzaar";
 
-    const deadlineMatch =
-      text.match(
-        /(дата\s+окончания|дедлайн|окончание|срок\s+подачи)[^\d]{0,40}(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}(?:\s+\d{1,2}:\d{2})?)/i,
-      ) || text.match(/(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}\s+\d{1,2}:\d{2})/);
+    const code = jsonTender.code || textTender.code || null;
+    const deadline = jsonTender.deadline || textTender.deadline || null;
 
-    const positionsMatch =
-      text.match(/позици[ийя]{1,2}[^\d]{0,20}(\d+)/i) ||
-      text.match(/лотов[^\d]{0,20}(\d+)/i);
-
-    const summary = text.replace(/\s+/g, " ").trim().slice(0, 900);
-
-    const documents = data.documents.map((doc, index) => ({
+    const domDocuments = domData.documents.map((doc, index) => ({
       name: normalizeDocumentName(
         doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
       ),
       url: doc.url,
     }));
 
+    const documents = [];
+    const seenDocs = new Set();
+
+    for (const doc of [...jsonTender.documents, ...domDocuments]) {
+      const key = `${doc.name}|${doc.url}`;
+
+      if (seenDocs.has(key)) continue;
+
+      seenDocs.add(key);
+      documents.push(doc);
+    }
+
+    const positionsCount =
+      jsonTender.positionsCount ||
+      textTender.positionsCount ||
+      documents.length ||
+      0;
+
+    const summary = domData.text
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 900);
+
     return {
-      title: data.title || "Тендер Bidzaar",
-      code: codeMatch?.[1] || null,
-      deadline: deadlineMatch?.[2] || deadlineMatch?.[1] || null,
-      positionsCount: positionsMatch ? Number(positionsMatch[1]) : documents.length || 0,
+      title,
+      code,
+      deadline,
+      positionsCount,
       summary,
       documents,
       sourceUrl: url,
+      diagnostics: {
+        pageTitle: domData.pageTitle,
+        textPreview: domData.text.replace(/\s+/g, " ").trim().slice(0, 250),
+        jsonResponsesCount: jsonResponses.length,
+        sampleUrls: responseUrls.slice(0, 20),
+      },
     };
   } finally {
     if (browser) {
@@ -460,6 +829,7 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
     if (!url) {
       return res.status(400).json({
         ok: false,
+        version: APP_VERSION,
         error: "url is required",
       });
     }
@@ -475,7 +845,12 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
         documentsCount: tender.documents.length,
+        documentsPreview: tender.documents.slice(0, 10).map((doc) => ({
+          name: doc.name,
+          url: doc.url,
+        })),
       },
+      diagnostics: tender.diagnostics,
     });
   } catch (error) {
     return res.status(500).json({
@@ -637,6 +1012,10 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
         total: tender.documents?.length || 0,
         uploaded: uploadedDocuments.length,
         errors: uploadErrorCount,
+      },
+      parser: {
+        jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
+        pageTitle: tender.diagnostics?.pageTitle || null,
       },
       usedColumnId: columnId,
       actualColumnId: fullTask?.columnId || null,
