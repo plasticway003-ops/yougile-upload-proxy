@@ -1,27 +1,28 @@
-require("dotenv").config();
-
-const express = require("express");
-const multer = require("multer");
-const axios = require("axios");
-const FormData = require("form-data");
-const cheerio = require("cheerio");
-const { chromium } = require("playwright");
+import express from "express";
+import cors from "cors";
+import axios from "axios";
+import FormData from "form-data";
+import { chromium } from "playwright";
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 
-app.use(express.json({ limit: "10mb" }));
+app.use(cors());
+app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
-const YOUGILE_TOKEN = (process.env.YOUGILE_TOKEN || "").trim();
-const PROXY_KEY = (process.env.PROXY_KEY || "").trim();
-const DEFAULT_COLUMN_ID = (process.env.YOUGILE_COLUMN_ID || "").trim();
+
+const PROXY_KEY = process.env.PROXY_KEY;
+const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
+const YOUGILE_BASE_URL = process.env.YOUGILE_BASE_URL || "https://ru.yougile.com";
+const YOUGILE_COLUMN_ID = process.env.YOUGILE_COLUMN_ID;
+
+const DEFAULT_COLUMN_ID = YOUGILE_COLUMN_ID;
 
 const STICKERS = {
   taskType: "f0f3804f-b18f-4c40-8b26-f9d4da7b3d04",
   positionsCount: "f84ddb36-0047-4df9-8b00-f998b4882707",
   source: "dceb4af0-5778-44b3-a0de-4078fb2c8933",
-  platform: "056d984a-95b0-4064-8825-9cf087fa8036"
+  platform: "056d984a-95b0-4064-8825-9cf087fa8036",
 };
 
 const STICKER_VALUES = {
@@ -29,101 +30,82 @@ const STICKER_VALUES = {
     "Город": "64e5efe2bd95",
     "Межгород": "350724eb0baa",
     "Совмещенный": "cbf0040c5f59",
-    "Совмещённый": "cbf0040c5f59"
+    "Совмещённый": "cbf0040c5f59",
   },
   source: {
-    "Почта": "2cfcf21f80e9"
+    "Почта": "2cfcf21f80e9",
   },
   platform: {
-    "Bidzaar": "be00170e0502"
-  }
+    "Bidzaar": "be00170e0502",
+  },
 };
 
-function checkProxyKey(req, res, next) {
-  const key = (req.header("x-proxy-key") || "").trim();
+function requireProxyKey(req, res, next) {
+  if (!PROXY_KEY) {
+    return res.status(500).json({
+      ok: false,
+      error: "PROXY_KEY is not configured",
+    });
+  }
 
-  if (!PROXY_KEY || key !== PROXY_KEY) {
+  const key = req.header("x-proxy-key");
+
+  if (key !== PROXY_KEY) {
     return res.status(401).json({
       ok: false,
-      error: "Invalid x-proxy-key"
+      error: "Unauthorized",
     });
   }
 
   next();
 }
 
-function axiosErrorDetails(error) {
-  return {
-    message: error.message,
-    status: error.response?.status,
-    data: error.response?.data
-  };
-}
-
-function getFileNameFromUrl(fileUrl) {
-  try {
-    const url = new URL(fileUrl);
-    const last = url.pathname.split("/").filter(Boolean).pop();
-    return decodeURIComponent(last || "document");
-  } catch {
-    return "document";
+function requireYouGileToken() {
+  if (!YOUGILE_TOKEN) {
+    throw new Error("YOUGILE_TOKEN is not configured");
   }
 }
 
-function absoluteUrl(baseUrl, href) {
-  try {
-    return new URL(href, baseUrl).toString();
-  } catch {
-    return href;
-  }
-}
-
-function cleanText(value) {
-  return String(value || "")
-    .replace(/\u00a0/g, " ")
+function normalizeDocumentName(name) {
+  return String(name || "document")
+    .replace(/^article\s+/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function normalizeDocumentName(name) {
-  return cleanText(name)
-    .replace(/^article\s+/i, "")
-    .replace(/^file\s+/i, "")
-    .replace(/\s+\./g, ".")
-    .trim();
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function buildYouGileHeaders() {
+  requireYouGileToken();
+
+  return {
+    Authorization: `Bearer ${YOUGILE_TOKEN}`,
+    "Content-Type": "application/json",
+  };
 }
 
-function uniqueByUrl(items) {
-  const seen = new Set();
-  const result = [];
-
-  for (const item of items) {
-    if (!item.url || seen.has(item.url)) continue;
-    seen.add(item.url);
-    result.push(item);
-  }
-
-  return result;
-}
-
-function parseRussianDateToMs(value) {
+function toTimestampMs(value) {
   if (!value) return null;
 
-  const match = String(value).match(
-    /([0-9]{2})\.([0-9]{2})\.([0-9]{4}),?\s*([0-9]{2}):([0-9]{2})/
+  if (typeof value === "number") {
+    return value;
+  }
+
+  const raw = String(value).trim();
+
+  const match = raw.match(
+    /(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})(?:\s+(\d{1,2}):(\d{2}))?/,
   );
 
   if (!match) return null;
 
-  const [, dd, mm, yyyy, hh, min] = match;
+  const [, dd, mm, yyyy, hh = "18", min = "00"] = match;
 
   const date = new Date(
     Number(yyyy),
@@ -132,883 +114,539 @@ function parseRussianDateToMs(value) {
     Number(hh),
     Number(min),
     0,
-    0
+    0,
   );
+
+  if (Number.isNaN(date.getTime())) return null;
 
   return date.getTime();
 }
 
-async function uploadBufferToYouGile(buffer, filename) {
-  if (!YOUGILE_TOKEN) {
-    throw new Error("YOUGILE_TOKEN is missing");
-  }
+function normalizeTaskType(taskType) {
+  if (!taskType) return "Город";
 
-  const form = new FormData();
-  form.append("file", buffer, normalizeDocumentName(filename));
+  const value = String(taskType).trim();
 
-  const response = await axios.post(
-    "https://yougile.com/api-v2/upload-file",
-    form,
-    {
-      headers: {
-        Authorization: `Bearer ${YOUGILE_TOKEN}`,
-        ...form.getHeaders()
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
-    }
-  );
+  if (value === "Совмещённый") return "Совмещенный";
+  if (STICKER_VALUES.taskType[value]) return value;
 
-  return response.data;
+  return "Город";
 }
 
-async function downloadUrlToBuffer(fileUrl, refererUrl) {
-  const response = await axios.get(fileUrl, {
-    responseType: "arraybuffer",
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    timeout: 60000,
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-      Referer: refererUrl || "https://bidzaar.com/"
-    }
-  });
+function makeDeadline(deadlineValue) {
+  const deadlineMs = toTimestampMs(deadlineValue);
 
-  let filename = getFileNameFromUrl(fileUrl);
-
-  const disposition = response.headers["content-disposition"];
-  if (disposition) {
-    const utfMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-    const simpleMatch = disposition.match(/filename="?([^";]+)"?/i);
-
-    if (utfMatch?.[1]) {
-      filename = decodeURIComponent(utfMatch[1]);
-    } else if (simpleMatch?.[1]) {
-      filename = decodeURIComponent(simpleMatch[1]);
-    }
-  }
+  if (!deadlineMs) return undefined;
 
   return {
-    buffer: Buffer.from(response.data),
-    filename: normalizeDocumentName(filename)
+    deadline: deadlineMs,
+    startDate: deadlineMs,
+    withTime: true,
+    history: [
+      {
+        deadline: deadlineMs,
+        startDate: deadlineMs,
+        withTime: true,
+        timestamp: Date.now(),
+      },
+    ],
   };
 }
 
-function extractBidzaarDataFromHtml(html, tenderUrl) {
-  const $ = cheerio.load(html);
-
-  $("script, style, noscript").remove();
-
-  const bodyText = cleanText($("body").text());
-
-  const title =
-    cleanText($("h1").first().text()) ||
-    cleanText($("title").text()).replace(/\s*\|\s*Bidzaar.*$/i, "") ||
-    "Bidzaar";
-
-  const codeMatch = bodyText.match(/Код:\s*([0-9A-Za-zА-Яа-яЁё\-]+)/i);
-
-  const deadlineMatch =
-    bodyText.match(/Прием предложений до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i) ||
-    bodyText.match(/до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i);
-
-  const publishedMatch = bodyText.match(
-    /Опубликован\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i
-  );
-
-  const locationMatch =
-    bodyText.match(/Место поставки\s*(.*?)\s*(Теги|Спецификация по позициям|Правила проведения запроса|Прием предложений до)/i);
-
-  const positionsMatch =
-    bodyText.match(/Спецификация по позициям\s*\((\d+)\)/i) ||
-    bodyText.match(/Позици[ияй]\s*\((\d+)\)/i);
-
-  const descriptionMatch =
-    bodyText.match(/Описание и документы\s*(.*?)\s*(Контакты|Место поставки|Теги|Спецификация по позициям|Правила проведения запроса)/i) ||
-    bodyText.match(/Описание\s*(.*?)\s*(Контакты|Место поставки|Теги|Спецификация по позициям|Правила проведения запроса)/i);
-
-  const rulesMatch =
-    bodyText.match(/Правила проведения запроса\s*(.*?)\s*(Прием предложений до|Вид запроса|После подачи|$)/i);
-
-  const documents = [];
-
-  $("a[href]").each((_, element) => {
-    const href = $(element).attr("href");
-    const text = cleanText($(element).text());
-
-    if (!href) return;
-
-    const isDocumentLink =
-      /filestorage\/files\/download/i.test(href) ||
-      /\/api\/.*file/i.test(href) ||
-      /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)(\?|$)/i.test(href);
-
-    if (!isDocumentLink) return;
-
-    let name = text || getFileNameFromUrl(href);
-
-    name = name
-      .replace(/\s*(pdf|docx?|xlsx?|zip|rar|7z|txt)\s*/gi, ".$1")
-      .replace(/\s*\d+([.,]\d+)?\s*(КБ|МБ|KB|MB).*$/i, "")
-      .trim();
-
-    documents.push({
-      name: normalizeDocumentName(name || "document"),
-      url: absoluteUrl(tenderUrl, href)
-    });
-  });
-
-  const summaryParts = [];
-
-  if (descriptionMatch?.[1]) {
-    summaryParts.push(cleanText(descriptionMatch[1]));
-  }
-
-  if (locationMatch?.[1]) {
-    summaryParts.push(`Место поставки: ${cleanText(locationMatch[1])}`);
-  }
-
-  if (deadlineMatch?.[1]) {
-    summaryParts.push(`Прием предложений до: ${cleanText(deadlineMatch[1])}`);
-  }
-
-  if (positionsMatch?.[1]) {
-    summaryParts.push(`Количество позиций: ${positionsMatch[1]}`);
-  }
-
-  if (rulesMatch?.[1]) {
-    summaryParts.push(`Правила: ${cleanText(rulesMatch[1]).slice(0, 700)}`);
-  }
+function makeStickers({ taskType = "Город", positionsCount = 0 } = {}) {
+  const normalizedTaskType = normalizeTaskType(taskType);
 
   return {
-    platform: "Bidzaar",
-    sourceUrl: tenderUrl,
-    title: cleanText(title),
-    code: codeMatch?.[1] || "",
-    deadline: deadlineMatch?.[1] ? cleanText(deadlineMatch[1]) : "",
-    publishedAt: publishedMatch?.[1] ? cleanText(publishedMatch[1]) : "",
-    location: locationMatch?.[1] ? cleanText(locationMatch[1]) : "",
-    positionsCount: positionsMatch?.[1] ? Number(positionsMatch[1]) : null,
-    summary: summaryParts.join("\n\n"),
-    documents: uniqueByUrl(documents),
-    rawTextPreview: bodyText.slice(0, 1000)
+    [STICKERS.taskType]: STICKER_VALUES.taskType[normalizedTaskType],
+    [STICKERS.positionsCount]: String(positionsCount ?? 0),
+    [STICKERS.source]: STICKER_VALUES.source["Почта"],
+    [STICKERS.platform]: STICKER_VALUES.platform["Bidzaar"],
   };
 }
 
-async function parseBidzaarWithBrowser(tenderUrl) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu"
-    ]
-  });
+function makeShortTask(fullTask) {
+  if (!fullTask) return null;
 
-  try {
-    const page = await browser.newPage({
-      viewport: {
-        width: 1366,
-        height: 900
-      },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
-    });
-
-    const apiResponses = [];
-
-    page.on("response", async (response) => {
-      const url = response.url();
-
-      if (!url.includes("bidzaar.com")) return;
-
-      const isUsefulApi =
-        url.includes("/api/") ||
-        url.includes("process") ||
-        url.includes("filestorage") ||
-        url.includes("files");
-
-      if (!isUsefulApi) return;
-
-      try {
-        const contentType = response.headers()["content-type"] || "";
-
-        if (!contentType.includes("application/json")) return;
-
-        const json = await response.json();
-
-        apiResponses.push({
-          url,
-          json
-        });
-      } catch {
-        // ignore
-      }
-    });
-
-    await page.goto(tenderUrl, {
-      waitUntil: "networkidle",
-      timeout: 60000
-    });
-
-    await page.waitForTimeout(5000);
-
-    try {
-      await page.waitForFunction(
-        () => {
-          const text = document.body.innerText || "";
-          return (
-            text.includes("Описание") ||
-            text.includes("Спецификация") ||
-            text.includes("Прием предложений") ||
-            text.includes("Место поставки")
-          );
-        },
-        {
-          timeout: 20000
-        }
-      );
-    } catch {
-      // parse whatever loaded
-    }
-
-    const html = await page.content();
-
-    const domLinks = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll("a[href]")).map((a) => ({
-        text: (a.innerText || a.textContent || "").trim(),
-        href: a.getAttribute("href")
-      }));
-    });
-
-    const data = extractBidzaarDataFromHtml(html, tenderUrl);
-
-    const apiDocuments = [];
-
-    function scanJsonForDocuments(value) {
-      if (!value || typeof value !== "object") return;
-
-      if (Array.isArray(value)) {
-        for (const item of value) scanJsonForDocuments(item);
-        return;
-      }
-
-      const keys = Object.keys(value);
-
-      const possibleName =
-        value.name ||
-        value.fileName ||
-        value.filename ||
-        value.originalName ||
-        value.title ||
-        value.displayName;
-
-      const possibleUrl =
-        value.url ||
-        value.downloadUrl ||
-        value.fileUrl ||
-        value.href ||
-        value.link;
-
-      const possibleId =
-        value.id ||
-        value.fileId ||
-        value.uuid ||
-        value.guid ||
-        value.storageId;
-
-      const cleanName = normalizeDocumentName(possibleName || "");
-
-      const hasFileExtension =
-        typeof cleanName === "string" &&
-        /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(cleanName);
-
-      if (possibleUrl && typeof possibleUrl === "string") {
-        const looksLikeDoc =
-          /filestorage|download|file/i.test(possibleUrl) ||
-          /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)(\?|$)/i.test(possibleUrl) ||
-          hasFileExtension;
-
-        if (looksLikeDoc) {
-          apiDocuments.push({
-            name: normalizeDocumentName(cleanName || getFileNameFromUrl(possibleUrl) || "document"),
-            url: absoluteUrl(tenderUrl, possibleUrl)
-          });
-        }
-      }
-
-      if (possibleId && cleanName && hasFileExtension) {
-        apiDocuments.push({
-          name: normalizeDocumentName(cleanName),
-          url: absoluteUrl(
-            tenderUrl,
-            `/api/filestorage/files/download/${possibleId}`
-          )
-        });
-      }
-
-      for (const key of keys) {
-        scanJsonForDocuments(value[key]);
-      }
-    }
-
-    for (const item of apiResponses) {
-      scanJsonForDocuments(item.json);
-    }
-
-    const linkDocuments = domLinks
-      .filter((link) => {
-        const href = link.href || "";
-        const text = link.text || "";
-
-        return (
-          /filestorage\/files\/download/i.test(href) ||
-          /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)(\?|$)/i.test(href) ||
-          /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(text)
-        );
-      })
-      .map((link) => ({
-        name: normalizeDocumentName(link.text || getFileNameFromUrl(link.href) || "document"),
-        url: absoluteUrl(tenderUrl, link.href)
-      }));
-
-    data.documents = uniqueByUrl([
-      ...data.documents,
-      ...linkDocuments,
-      ...apiDocuments
-    ]);
-
-    data.debug = {
-      domLinksCount: domLinks.length,
-      apiResponsesCount: apiResponses.length
-    };
-
-    return data;
-  } finally {
-    await browser.close();
-  }
+  return {
+    id: fullTask.id || null,
+    idTaskProject: fullTask.idTaskProject || null,
+    idTaskCommon: fullTask.idTaskCommon || null,
+    title: fullTask.title || null,
+    columnId: fullTask.columnId || null,
+  };
 }
 
-function buildTenderDescriptionHtml(tender, uploadedDocs) {
-  const summary = escapeHtml(tender.summary || "Выжимка не сформирована.");
+function makeDescription({ summary, documents = [], sourceUrl }) {
+  const safeSummary = summary
+    ? htmlEscape(summary)
+    : "Данные автоматически перенесены из Bidzaar.";
 
-  const docLinks = uploadedDocs.length
-    ? uploadedDocs
+  const docsHtml = documents.length
+    ? documents
         .map((doc) => {
-          const name = escapeHtml(normalizeDocumentName(doc.filename || doc.name || "document"));
-          const url = escapeHtml(doc.fullUrl || doc.url || "");
+          const name = htmlEscape(normalizeDocumentName(doc.name || doc.filename));
+          const url = htmlEscape(doc.yougileUrl || doc.url);
+
           return `<a target="_blank" rel="noopener noreferrer" href="${url}">${name}</a>`;
         })
         .join("<br>")
-    : "Документы не загружены.";
+    : "Документы не найдены.";
 
-  const sourceUrl = escapeHtml(tender.sourceUrl || "");
+  const safeSourceUrl = htmlEscape(sourceUrl);
 
   return [
-    `<p><strong>Выжимка:</strong></p>`,
-    `<p>${summary.replace(/\n/g, "<br>")}</p>`,
-    `<p><strong>Код:</strong> ${escapeHtml(tender.code || "")}</p>`,
-    `<p><strong>Срок подачи:</strong> ${escapeHtml(tender.deadline || "")}</p>`,
-    `<p><strong>Место:</strong> ${escapeHtml(tender.location || "")}</p>`,
-    `<p><strong>Количество позиций:</strong> ${escapeHtml(tender.positionsCount || "")}</p>`,
-    `<p><strong>Документация:</strong><br>${docLinks}</p>`,
-    `<p><strong>Ссылка:</strong> <a target="_blank" rel="noopener noreferrer" href="${sourceUrl}">ссылка</a></p>`
+    `<p><strong>Выжимка:</strong> ${safeSummary}</p>`,
+    `<p><strong>Документация:</strong><br>${docsHtml}</p>`,
+    `<p><strong>Ссылка:</strong> <a target="_blank" rel="noopener noreferrer" href="${safeSourceUrl}">ссылка</a></p>`,
   ].join("");
 }
 
-async function listYouGileTasksByTitle(title) {
-  if (!YOUGILE_TOKEN) {
-    throw new Error("YOUGILE_TOKEN is missing");
+function getFilenameFromUrl(url, fallback = "document") {
+  try {
+    const parsed = new URL(url);
+    const pathname = decodeURIComponent(parsed.pathname);
+    const last = pathname.split("/").filter(Boolean).pop();
+
+    return normalizeDocumentName(last || fallback);
+  } catch {
+    return normalizeDocumentName(fallback);
   }
+}
 
-  if (!title) return [];
-
-  const response = await axios.get("https://yougile.com/api-v2/tasks", {
+async function downloadFileByUrl(url, filename) {
+  const response = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: 120000,
+    maxRedirects: 10,
     headers: {
-      Authorization: `Bearer ${YOUGILE_TOKEN}`
+      "User-Agent": "Mozilla/5.0",
     },
-    params: {
-      title,
-      limit: 50,
-      offset: 0,
-      includeDeleted: false
-    },
-    timeout: 60000
   });
 
-  return response.data?.content || [];
+  return {
+    buffer: Buffer.from(response.data),
+    contentType: response.headers["content-type"] || "application/octet-stream",
+    filename: normalizeDocumentName(filename || getFilenameFromUrl(url)),
+  };
 }
 
-async function findDuplicateTender(tender) {
-  const candidates = [];
+async function uploadFileToYouGile({ buffer, filename, contentType }) {
+  requireYouGileToken();
 
-  if (tender.code) {
-    candidates.push(...(await listYouGileTasksByTitle(tender.code)));
-  }
+  const form = new FormData();
 
-  const titleWords = cleanText(tender.title)
-    .split(" ")
-    .filter((word) => word.length > 5)
-    .slice(0, 4)
-    .join(" ");
-
-  if (titleWords) {
-    candidates.push(...(await listYouGileTasksByTitle(titleWords)));
-  }
-
-  const seen = new Set();
-  const unique = [];
-
-  for (const task of candidates) {
-    if (!task.id || seen.has(task.id)) continue;
-    seen.add(task.id);
-    unique.push(task);
-  }
-
-  const sourceUrl = tender.sourceUrl || "";
-  const code = tender.code || "";
-
-  return unique.find((task) => {
-    const title = task.title || "";
-    const description = task.description || "";
-
-    return (
-      (code && (title.includes(code) || description.includes(code))) ||
-      (sourceUrl && description.includes(sourceUrl))
-    );
-  }) || null;
-}
-
-async function createYouGileTask(payload) {
-  if (!YOUGILE_TOKEN) {
-    throw new Error("YOUGILE_TOKEN is missing");
-  }
+  form.append("file", buffer, {
+    filename: normalizeDocumentName(filename),
+    contentType: contentType || "application/octet-stream",
+  });
 
   const response = await axios.post(
-    "https://yougile.com/api-v2/tasks",
-    payload,
+    `${YOUGILE_BASE_URL}/api-v2/upload-file`,
+    form,
     {
+      timeout: 120000,
       headers: {
         Authorization: `Bearer ${YOUGILE_TOKEN}`,
-        "Content-Type": "application/json"
+        ...form.getHeaders(),
       },
-      timeout: 60000
-    }
+    },
+  );
+
+  const data = response.data || {};
+
+  const url =
+    data.url ||
+    data.href ||
+    data.downloadUrl ||
+    data.fileUrl ||
+    data?.data?.url ||
+    data?.data?.href;
+
+  if (!url) {
+    throw new Error(`YouGile upload response has no file url: ${JSON.stringify(data)}`);
+  }
+
+  return {
+    name: normalizeDocumentName(filename),
+    url,
+    raw: data,
+  };
+}
+
+async function uploadTenderFileByUrl(url, filename) {
+  const downloaded = await downloadFileByUrl(url, filename);
+  const uploaded = await uploadFileToYouGile(downloaded);
+
+  return {
+    name: normalizeDocumentName(downloaded.filename),
+    originalUrl: url,
+    yougileUrl: uploaded.url,
+    raw: uploaded.raw,
+  };
+}
+
+async function createYouGileTask(taskPayload) {
+  const response = await axios.post(
+    `${YOUGILE_BASE_URL}/api-v2/tasks`,
+    taskPayload,
+    {
+      timeout: 120000,
+      headers: buildYouGileHeaders(),
+    },
   );
 
   return response.data;
 }
 
 async function getYouGileTaskByIdApi(taskId) {
-  if (!YOUGILE_TOKEN) {
-    throw new Error("YOUGILE_TOKEN is missing");
+  if (!taskId) {
+    throw new Error("taskId is required");
   }
 
-  if (!taskId) return null;
-
   const response = await axios.get(
-    `https://yougile.com/api-v2/tasks/${taskId}`,
+    `${YOUGILE_BASE_URL}/api-v2/tasks/${taskId}`,
     {
-      headers: {
-        Authorization: `Bearer ${YOUGILE_TOKEN}`
-      },
-      timeout: 60000
-    }
+      timeout: 120000,
+      headers: buildYouGileHeaders(),
+    },
   );
 
   return response.data;
 }
 
-function extractCreatedTaskId(taskResponse) {
+function getCreatedTaskId(createdResponse) {
   return (
-    taskResponse?.id ||
-    taskResponse?.task?.id ||
-    taskResponse?.result?.id ||
-    taskResponse?.data?.id ||
-    ""
+    createdResponse?.id ||
+    createdResponse?.task?.id ||
+    createdResponse?.taskId ||
+    createdResponse?.data?.id ||
+    createdResponse?.data?.task?.id ||
+    null
   );
 }
 
-function makeShortTask(task) {
-  return {
-    id: task?.id || "",
-    idTaskProject: task?.idTaskProject || "",
-    idTaskCommon: task?.idTaskCommon || "",
-    title: task?.title || "",
-    columnId: task?.columnId || ""
-  };
-}
+async function parseBidzaarTenderPage(url) {
+  let browser;
 
-async function createTenderFromUrl({
-  url,
-  columnId,
-  taskType,
-  assigned,
-  color,
-  skipDuplicateCheck
-}) {
-  const finalColumnId = columnId || DEFAULT_COLUMN_ID;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
 
-  if (!finalColumnId) {
-    throw new Error("columnId is required. Pass columnId or set YOUGILE_COLUMN_ID in Render Environment.");
-  }
+    const page = await browser.newPage({
+      viewport: {
+        width: 1440,
+        height: 1200,
+      },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    });
 
-  const tender = await parseBidzaarWithBrowser(url);
+    await page.goto(url, {
+      waitUntil: "networkidle",
+      timeout: 90000,
+    });
 
-  if (!skipDuplicateCheck) {
-    const duplicate = await findDuplicateTender(tender);
+    await page.waitForTimeout(3000);
 
-    if (duplicate) {
+    const data = await page.evaluate(() => {
+      const text = document.body?.innerText || "";
+
+      const title =
+        document.querySelector("h1")?.innerText?.trim() ||
+        document.querySelector("h2")?.innerText?.trim() ||
+        document.title?.trim() ||
+        "Тендер Bidzaar";
+
+      const anchors = Array.from(document.querySelectorAll("a"));
+
+      const documents = anchors
+        .map((a) => {
+          const href = a.href;
+          const name = (a.innerText || a.getAttribute("download") || "").trim();
+
+          return {
+            name,
+            url: href,
+          };
+        })
+        .filter((item) => {
+          if (!item.url) return false;
+
+          const lower = item.url.toLowerCase();
+          const nameLower = item.name.toLowerCase();
+
+          return (
+            lower.includes(".doc") ||
+            lower.includes(".docx") ||
+            lower.includes(".xls") ||
+            lower.includes(".xlsx") ||
+            lower.includes(".pdf") ||
+            lower.includes(".zip") ||
+            lower.includes("download") ||
+            nameLower.includes(".doc") ||
+            nameLower.includes(".docx") ||
+            nameLower.includes(".xls") ||
+            nameLower.includes(".xlsx") ||
+            nameLower.includes(".pdf") ||
+            nameLower.includes(".zip")
+          );
+        });
+
       return {
-        status: "duplicate",
-        tender,
-        duplicateTask: duplicate,
-        uploadedDocs: [],
-        task: null
+        title,
+        text,
+        documents,
       };
-    }
-  }
+    });
 
-  const uploadedDocs = [];
+    const text = data.text || "";
 
-  for (const doc of tender.documents || []) {
-    try {
-      const downloaded = await downloadUrlToBuffer(doc.url, tender.sourceUrl);
+    const codeMatch =
+      text.match(/код[:\s№-]*([0-9]{2,}[-/][0-9]{2,})/i) ||
+      text.match(/№[:\s]*([0-9]{2,}[-/][0-9]{2,})/i);
 
-      const cleanDocName = normalizeDocumentName(doc.name || "");
-      const cleanDownloadedName = normalizeDocumentName(downloaded.filename || "");
+    const deadlineMatch =
+      text.match(
+        /(дата\s+окончания|дедлайн|окончание|срок\s+подачи)[^\d]{0,40}(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}(?:\s+\d{1,2}:\d{2})?)/i,
+      ) || text.match(/(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}\s+\d{1,2}:\d{2})/);
 
-      const filename =
-        cleanDocName && /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(cleanDocName)
-          ? cleanDocName
-          : cleanDownloadedName;
+    const positionsMatch =
+      text.match(/позици[ийя]{1,2}[^\d]{0,20}(\d+)/i) ||
+      text.match(/лотов[^\d]{0,20}(\d+)/i);
 
-      const result = await uploadBufferToYouGile(downloaded.buffer, filename);
+    const summary = text
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 900);
 
-      uploadedDocs.push({
-        sourceUrl: doc.url,
-        ok: true,
-        name: cleanDocName,
-        filename: normalizeDocumentName(filename),
-        url: result?.url,
-        fullUrl: result?.fullUrl
-      });
-    } catch (error) {
-      uploadedDocs.push({
-        sourceUrl: doc.url,
-        ok: false,
-        name: normalizeDocumentName(doc.name),
-        error: axiosErrorDetails(error)
-      });
-    }
-  }
+    const documents = data.documents.map((doc, index) => ({
+      name: normalizeDocumentName(
+        doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
+      ),
+      url: doc.url,
+    }));
 
-  const taskTypeName = taskType || "Город";
-  const taskTypeValue =
-    STICKER_VALUES.taskType[taskTypeName] || STICKER_VALUES.taskType["Город"];
-
-  const stickers = {
-    [STICKERS.platform]: STICKER_VALUES.platform.Bidzaar,
-    [STICKERS.source]: STICKER_VALUES.source["Почта"],
-    [STICKERS.positionsCount]: String(tender.positionsCount || ""),
-    [STICKERS.taskType]: taskTypeValue
-  };
-
-  const deadlineMs = parseRussianDateToMs(tender.deadline);
-
-  const taskPayload = {
-    title: tender.title || "Тендер Bidzaar",
-    columnId: finalColumnId,
-    description: buildTenderDescriptionHtml(
-      tender,
-      uploadedDocs.filter((doc) => doc.ok)
-    ),
-    stickers
-  };
-
-  if (Array.isArray(assigned) && assigned.length > 0) {
-    taskPayload.assigned = assigned;
-  }
-
-  if (color) {
-    taskPayload.color = color;
-  }
-
-  if (deadlineMs) {
-    taskPayload.deadline = {
-      deadline: deadlineMs,
-      startDate: deadlineMs,
-      withTime: true,
-      history: [
-        {
-          deadline: deadlineMs,
-          startDate: deadlineMs,
-          timestamp: Date.now(),
-          notifyBefore: 900000,
-          withTime: true
-        }
-      ]
-    };
-  }
-
-  const createdTaskResponse = await createYouGileTask(taskPayload);
-  const createdTaskId = extractCreatedTaskId(createdTaskResponse);
-
-  let fullTask = createdTaskResponse;
-
-  if (createdTaskId) {
-    try {
-      fullTask = await getYouGileTaskByIdApi(createdTaskId);
-    } catch (error) {
-      console.log("GET CREATED TASK ERROR", axiosErrorDetails(error));
-    }
-  }
-
-  return {
-    status: "created",
-    tender,
-    uploadedDocs,
-    task: fullTask
-  };
-}
-
-function makeCreateTenderShortResponse(result) {
-  const tender = result.tender || {};
-  const uploadedDocs = result.uploadedDocs || [];
-  const successfulFiles = uploadedDocs.filter((doc) => doc.ok);
-  const failedFiles = uploadedDocs.filter((doc) => !doc.ok);
-
-  if (result.status === "duplicate") {
     return {
-      ok: true,
-      status: "duplicate",
-      message: "Карточка по этому тендеру уже существует. Новая карточка не создана.",
-      duplicateTask: makeShortTask(result.duplicateTask),
-      title: tender.title || "",
-      code: tender.code || "",
-      deadline: tender.deadline || "",
-      sourceUrl: tender.sourceUrl || ""
+      title: data.title || "Тендер Bidzaar",
+      code: codeMatch?.[1] || null,
+      deadline: deadlineMatch?.[2] || deadlineMatch?.[1] || null,
+      positionsCount: positionsMatch ? Number(positionsMatch[1]) : documents.length || 0,
+      summary,
+      documents,
+      sourceUrl: url,
     };
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
-
-  return {
-    ok: true,
-    status: "created",
-    task: makeShortTask(result.task),
-    title: tender.title || "",
-    code: tender.code || "",
-    deadline: tender.deadline || "",
-    location: tender.location || "",
-    positionsCount: tender.positionsCount || null,
-    sourceUrl: tender.sourceUrl || "",
-    documentsFound: Array.isArray(tender.documents) ? tender.documents.length : 0,
-    documentsUploaded: successfulFiles.length,
-    uploadedFiles: successfulFiles.map((doc) => ({
-      filename: normalizeDocumentName(doc.filename || doc.name || ""),
-      fullUrl: doc.fullUrl || doc.url || ""
-    })),
-    failedFiles: failedFiles.map((doc) => ({
-      name: normalizeDocumentName(doc.name || ""),
-      sourceUrl: doc.sourceUrl || "",
-      error: doc.error?.message || "Upload failed"
-    }))
-  };
 }
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "yougile-upload-proxy",
+    endpoints: [
+      "POST /parse-bidzaar",
+      "POST /upload-by-url",
+      "POST /create-tender-from-url",
+    ],
+  });
 });
 
-app.post("/parse-bidzaar", checkProxyKey, async (req, res) => {
+app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
   try {
-    const tenderUrl = req.body.url;
+    const { url } = req.body || {};
 
-    if (!tenderUrl) {
+    if (!url) {
       return res.status(400).json({
         ok: false,
-        error: "Pass url"
+        error: "url is required",
       });
     }
 
-    if (!/^https:\/\/bidzaar\.com\/app\/process\/light\//i.test(tenderUrl)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Only Bidzaar light tender URLs are supported"
-      });
-    }
+    const tender = await parseBidzaarTenderPage(url);
 
-    const data = await parseBidzaarWithBrowser(tenderUrl);
-
-    res.json({
+    return res.json({
       ok: true,
-      platform: data.platform,
-      sourceUrl: data.sourceUrl,
-      title: data.title,
-      code: data.code,
-      deadline: data.deadline,
-      publishedAt: data.publishedAt,
-      location: data.location,
-      positionsCount: data.positionsCount,
-      summary: data.summary,
-      documents: data.documents,
-      debug: data.debug
+      tender,
     });
   } catch (error) {
-    const details = axiosErrorDetails(error);
-
-    console.log("PARSE-BIDZAAR ERROR", details);
-
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
-      error: "Bidzaar parse failed",
-      details
+      error: error.message,
     });
   }
 });
 
-app.post("/create-tender-from-url", checkProxyKey, async (req, res) => {
+app.post("/upload-by-url", requireProxyKey, async (req, res) => {
   try {
-    const tenderUrl = req.body.url;
+    const { url, urls } = req.body || {};
 
-    if (!tenderUrl) {
+    const items = Array.isArray(urls) ? urls : url ? [url] : [];
+
+    if (!items.length) {
       return res.status(400).json({
         ok: false,
-        error: "Pass url"
-      });
-    }
-
-    if (!/^https:\/\/bidzaar\.com\/app\/process\/light\//i.test(tenderUrl)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Only Bidzaar light tender URLs are supported"
-      });
-    }
-
-    const result = await createTenderFromUrl({
-      url: tenderUrl,
-      columnId: req.body.columnId,
-      taskType: req.body.taskType || req.body.type,
-      assigned: req.body.assigned,
-      color: req.body.color,
-      skipDuplicateCheck: Boolean(req.body.skipDuplicateCheck)
-    });
-
-    res.json(makeCreateTenderShortResponse(result));
-  } catch (error) {
-    const details = axiosErrorDetails(error);
-
-    console.log("CREATE-TENDER-FROM-URL ERROR", details);
-
-    res.status(500).json({
-      ok: false,
-      error: "Create tender from URL failed",
-      details
-    });
-  }
-});
-
-app.post("/upload", checkProxyKey, upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        ok: false,
-        error: "No file uploaded. Use multipart field: file"
-      });
-    }
-
-    const cleanFilename = normalizeDocumentName(req.file.originalname);
-
-    const result = await uploadBufferToYouGile(
-      req.file.buffer,
-      cleanFilename
-    );
-
-    res.json({
-      ok: true,
-      filename: cleanFilename,
-      url: result?.url,
-      fullUrl: result?.fullUrl
-    });
-  } catch (error) {
-    const details = axiosErrorDetails(error);
-
-    console.log("UPLOAD ERROR", details);
-
-    res.status(500).json({
-      ok: false,
-      error: "Upload failed",
-      details
-    });
-  }
-});
-
-app.post("/upload-by-url", checkProxyKey, async (req, res) => {
-  try {
-    const inputUrls = req.body.urls || (req.body.url ? [req.body.url] : []);
-
-    if (!Array.isArray(inputUrls) || inputUrls.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Pass url or urls[]"
+        error: "url or urls is required",
       });
     }
 
     const uploaded = [];
+    const errors = [];
 
-    for (const fileUrl of inputUrls) {
+    for (const itemUrl of items) {
       try {
-        const downloaded = await downloadUrlToBuffer(fileUrl);
-
-        const cleanFilename = normalizeDocumentName(downloaded.filename);
-
-        const result = await uploadBufferToYouGile(
-          downloaded.buffer,
-          cleanFilename
-        );
-
-        uploaded.push({
-          sourceUrl: fileUrl,
-          ok: true,
-          filename: cleanFilename,
-          url: result?.url,
-          fullUrl: result?.fullUrl
-        });
+        const result = await uploadTenderFileByUrl(itemUrl);
+        uploaded.push(result);
       } catch (error) {
-        const details = axiosErrorDetails(error);
-
-        console.log("UPLOAD-BY-URL ERROR", {
-          sourceUrl: fileUrl,
-          ...details
-        });
-
-        uploaded.push({
-          sourceUrl: fileUrl,
-          ok: false,
-          error: details
+        errors.push({
+          url: itemUrl,
+          error: error.message,
         });
       }
     }
 
-    res.json({
-      ok: true,
-      count: uploaded.length,
-      uploaded
+    return res.json({
+      ok: errors.length === 0,
+      uploaded,
+      errors,
     });
   } catch (error) {
-    const details = axiosErrorDetails(error);
-
-    console.log("UPLOAD-BY-URL FATAL ERROR", details);
-
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
-      error: "upload-by-url failed",
-      details
+      error: error.message,
+    });
+  }
+});
+
+app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
+  try {
+    const {
+      url,
+      columnId: bodyColumnId,
+      taskType = "Город",
+      type,
+      assigned = [],
+      color,
+    } = req.body || {};
+
+    if (!url) {
+      return res.status(400).json({
+        ok: false,
+        error: "url is required",
+      });
+    }
+
+    const columnId = bodyColumnId || DEFAULT_COLUMN_ID;
+
+    if (!columnId) {
+      return res.status(400).json({
+        ok: false,
+        error: "columnId is required. Pass columnId in body or set YOUGILE_COLUMN_ID env.",
+      });
+    }
+
+    const tender = await parseBidzaarTenderPage(url);
+
+    const uploadedDocuments = [];
+    const uploadErrors = [];
+
+    for (const doc of tender.documents || []) {
+      try {
+        const uploaded = await uploadTenderFileByUrl(
+          doc.url,
+          normalizeDocumentName(doc.name),
+        );
+
+        uploadedDocuments.push(uploaded);
+      } catch (error) {
+        uploadErrors.push({
+          name: normalizeDocumentName(doc.name),
+          url: doc.url,
+          error: error.message,
+        });
+      }
+    }
+
+    const finalTaskType = type || taskType || "Город";
+
+    const title = tender.title || "Тендер Bidzaar";
+
+    const taskPayload = {
+      title,
+      columnId,
+      description: makeDescription({
+        summary: tender.summary,
+        documents: uploadedDocuments,
+        sourceUrl: url,
+      }),
+      stickers: makeStickers({
+        taskType: finalTaskType,
+        positionsCount: tender.positionsCount || uploadedDocuments.length || 0,
+      }),
+    };
+
+    const deadline = makeDeadline(tender.deadline);
+
+    if (deadline) {
+      taskPayload.deadline = deadline;
+    }
+
+    if (Array.isArray(assigned) && assigned.length) {
+      taskPayload.assigned = assigned;
+    }
+
+    if (color) {
+      taskPayload.color = color;
+    }
+
+    const createdTask = await createYouGileTask(taskPayload);
+    const createdTaskId = getCreatedTaskId(createdTask);
+
+    if (!createdTaskId) {
+      return res.status(500).json({
+        ok: false,
+        error: "Task created, but created task id was not found in YouGile response",
+        createdTask,
+      });
+    }
+
+    const fullTask = await getYouGileTaskByIdApi(createdTaskId);
+
+    return res.json({
+      ok: true,
+      task: makeShortTask(fullTask),
+      fullTask,
+      createdTask,
+      tender: {
+        title: tender.title,
+        code: tender.code,
+        deadline: tender.deadline,
+        positionsCount: tender.positionsCount,
+        sourceUrl: tender.sourceUrl,
+      },
+      documents: {
+        total: tender.documents?.length || 0,
+        uploaded: uploadedDocuments.length,
+        errors: uploadErrors.length,
+        items: uploadedDocuments,
+        uploadErrors,
+      },
+      usedColumnId: columnId,
+      actualColumnId: fullTask?.columnId || null,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`YouGile upload proxy started on port ${PORT}`);
+  console.log(`YouGile proxy is running on port ${PORT}`);
 });
