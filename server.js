@@ -85,6 +85,14 @@ function cleanText(value) {
     .trim();
 }
 
+function normalizeDocumentName(name) {
+  return cleanText(name)
+    .replace(/^article\s+/i, "")
+    .replace(/^file\s+/i, "")
+    .replace(/\s+\./g, ".")
+    .trim();
+}
+
 function escapeHtml(value) {
   return String(value || "")
     .replace(/&/g, "&amp;")
@@ -136,7 +144,7 @@ async function uploadBufferToYouGile(buffer, filename) {
   }
 
   const form = new FormData();
-  form.append("file", buffer, filename);
+  form.append("file", buffer, normalizeDocumentName(filename));
 
   const response = await axios.post(
     "https://yougile.com/api-v2/upload-file",
@@ -183,7 +191,7 @@ async function downloadUrlToBuffer(fileUrl, refererUrl) {
 
   return {
     buffer: Buffer.from(response.data),
-    filename
+    filename: normalizeDocumentName(filename)
   };
 }
 
@@ -246,7 +254,7 @@ function extractBidzaarDataFromHtml(html, tenderUrl) {
       .trim();
 
     documents.push({
-      name: name || "document",
+      name: normalizeDocumentName(name || "document"),
       url: absoluteUrl(tenderUrl, href)
     });
   });
@@ -411,9 +419,11 @@ async function parseBidzaarWithBrowser(tenderUrl) {
         value.guid ||
         value.storageId;
 
+      const cleanName = normalizeDocumentName(possibleName || "");
+
       const hasFileExtension =
-        typeof possibleName === "string" &&
-        /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(possibleName);
+        typeof cleanName === "string" &&
+        /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(cleanName);
 
       if (possibleUrl && typeof possibleUrl === "string") {
         const looksLikeDoc =
@@ -423,15 +433,15 @@ async function parseBidzaarWithBrowser(tenderUrl) {
 
         if (looksLikeDoc) {
           apiDocuments.push({
-            name: cleanText(possibleName || getFileNameFromUrl(possibleUrl) || "document"),
+            name: normalizeDocumentName(cleanName || getFileNameFromUrl(possibleUrl) || "document"),
             url: absoluteUrl(tenderUrl, possibleUrl)
           });
         }
       }
 
-      if (possibleId && possibleName && hasFileExtension) {
+      if (possibleId && cleanName && hasFileExtension) {
         apiDocuments.push({
-          name: cleanText(possibleName),
+          name: normalizeDocumentName(cleanName),
           url: absoluteUrl(
             tenderUrl,
             `/api/filestorage/files/download/${possibleId}`
@@ -460,7 +470,7 @@ async function parseBidzaarWithBrowser(tenderUrl) {
         );
       })
       .map((link) => ({
-        name: cleanText(link.text || getFileNameFromUrl(link.href) || "document"),
+        name: normalizeDocumentName(link.text || getFileNameFromUrl(link.href) || "document"),
         url: absoluteUrl(tenderUrl, link.href)
       }));
 
@@ -487,7 +497,7 @@ function buildTenderDescriptionHtml(tender, uploadedDocs) {
   const docLinks = uploadedDocs.length
     ? uploadedDocs
         .map((doc) => {
-          const name = escapeHtml(doc.filename || doc.name || "document");
+          const name = escapeHtml(normalizeDocumentName(doc.filename || doc.name || "document"));
           const url = escapeHtml(doc.fullUrl || doc.url || "");
           return `<a target="_blank" rel="noopener noreferrer" href="${url}">${name}</a>`;
         })
@@ -591,6 +601,36 @@ async function createYouGileTask(payload) {
   return response.data;
 }
 
+async function getYouGileTaskByIdApi(taskId) {
+  if (!YOUGILE_TOKEN) {
+    throw new Error("YOUGILE_TOKEN is missing");
+  }
+
+  if (!taskId) return null;
+
+  const response = await axios.get(
+    `https://yougile.com/api-v2/tasks/${taskId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${YOUGILE_TOKEN}`
+      },
+      timeout: 60000
+    }
+  );
+
+  return response.data;
+}
+
+function extractCreatedTaskId(taskResponse) {
+  return (
+    taskResponse?.id ||
+    taskResponse?.task?.id ||
+    taskResponse?.result?.id ||
+    taskResponse?.data?.id ||
+    ""
+  );
+}
+
 function makeShortTask(task) {
   return {
     id: task?.id || "",
@@ -637,18 +677,21 @@ async function createTenderFromUrl({
     try {
       const downloaded = await downloadUrlToBuffer(doc.url, tender.sourceUrl);
 
+      const cleanDocName = normalizeDocumentName(doc.name || "");
+      const cleanDownloadedName = normalizeDocumentName(downloaded.filename || "");
+
       const filename =
-        doc.name && /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(doc.name)
-          ? doc.name
-          : downloaded.filename;
+        cleanDocName && /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(cleanDocName)
+          ? cleanDocName
+          : cleanDownloadedName;
 
       const result = await uploadBufferToYouGile(downloaded.buffer, filename);
 
       uploadedDocs.push({
         sourceUrl: doc.url,
         ok: true,
-        name: doc.name,
-        filename,
+        name: cleanDocName,
+        filename: normalizeDocumentName(filename),
         url: result?.url,
         fullUrl: result?.fullUrl
       });
@@ -656,7 +699,7 @@ async function createTenderFromUrl({
       uploadedDocs.push({
         sourceUrl: doc.url,
         ok: false,
-        name: doc.name,
+        name: normalizeDocumentName(doc.name),
         error: axiosErrorDetails(error)
       });
     }
@@ -710,13 +753,24 @@ async function createTenderFromUrl({
     };
   }
 
-  const task = await createYouGileTask(taskPayload);
+  const createdTaskResponse = await createYouGileTask(taskPayload);
+  const createdTaskId = extractCreatedTaskId(createdTaskResponse);
+
+  let fullTask = createdTaskResponse;
+
+  if (createdTaskId) {
+    try {
+      fullTask = await getYouGileTaskByIdApi(createdTaskId);
+    } catch (error) {
+      console.log("GET CREATED TASK ERROR", axiosErrorDetails(error));
+    }
+  }
 
   return {
     status: "created",
     tender,
     uploadedDocs,
-    task
+    task: fullTask
   };
 }
 
@@ -752,11 +806,11 @@ function makeCreateTenderShortResponse(result) {
     documentsFound: Array.isArray(tender.documents) ? tender.documents.length : 0,
     documentsUploaded: successfulFiles.length,
     uploadedFiles: successfulFiles.map((doc) => ({
-      filename: doc.filename || doc.name || "",
+      filename: normalizeDocumentName(doc.filename || doc.name || ""),
       fullUrl: doc.fullUrl || doc.url || ""
     })),
     failedFiles: failedFiles.map((doc) => ({
-      name: doc.name || "",
+      name: normalizeDocumentName(doc.name || ""),
       sourceUrl: doc.sourceUrl || "",
       error: doc.error?.message || "Upload failed"
     }))
@@ -864,14 +918,16 @@ app.post("/upload", checkProxyKey, upload.single("file"), async (req, res) => {
       });
     }
 
+    const cleanFilename = normalizeDocumentName(req.file.originalname);
+
     const result = await uploadBufferToYouGile(
       req.file.buffer,
-      req.file.originalname
+      cleanFilename
     );
 
     res.json({
       ok: true,
-      filename: req.file.originalname,
+      filename: cleanFilename,
       url: result?.url,
       fullUrl: result?.fullUrl
     });
@@ -905,15 +961,17 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
       try {
         const downloaded = await downloadUrlToBuffer(fileUrl);
 
+        const cleanFilename = normalizeDocumentName(downloaded.filename);
+
         const result = await uploadBufferToYouGile(
           downloaded.buffer,
-          downloaded.filename
+          cleanFilename
         );
 
         uploaded.push({
           sourceUrl: fileUrl,
           ok: true,
-          filename: downloaded.filename,
+          filename: cleanFilename,
           url: result?.url,
           fullUrl: result?.fullUrl
         });
