@@ -15,6 +15,29 @@ app.use(express.json({ limit: "10mb" }));
 const PORT = process.env.PORT || 3000;
 const YOUGILE_TOKEN = (process.env.YOUGILE_TOKEN || "").trim();
 const PROXY_KEY = (process.env.PROXY_KEY || "").trim();
+const DEFAULT_COLUMN_ID = (process.env.YOUGILE_COLUMN_ID || "").trim();
+
+const STICKERS = {
+  taskType: "f0f3804f-b18f-4c40-8b26-f9d4da7b3d04",
+  positionsCount: "f84ddb36-0047-4df9-8b00-f998b4882707",
+  source: "dceb4af0-5778-44b3-a0de-4078fb2c8933",
+  platform: "056d984a-95b0-4064-8825-9cf087fa8036"
+};
+
+const STICKER_VALUES = {
+  taskType: {
+    "Город": "64e5efe2bd95",
+    "Межгород": "350724eb0baa",
+    "Совмещенный": "cbf0040c5f59",
+    "Совмещённый": "cbf0040c5f59"
+  },
+  source: {
+    "Почта": "2cfcf21f80e9"
+  },
+  platform: {
+    "Bidzaar": "be00170e0502"
+  }
+};
 
 function checkProxyKey(req, res, next) {
   const key = (req.header("x-proxy-key") || "").trim();
@@ -62,6 +85,14 @@ function cleanText(value) {
     .trim();
 }
 
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function uniqueByUrl(items) {
   const seen = new Set();
   const result = [];
@@ -73,6 +104,30 @@ function uniqueByUrl(items) {
   }
 
   return result;
+}
+
+function parseRussianDateToMs(value) {
+  if (!value) return null;
+
+  const match = String(value).match(
+    /([0-9]{2})\.([0-9]{2})\.([0-9]{4}),?\s*([0-9]{2}):([0-9]{2})/
+  );
+
+  if (!match) return null;
+
+  const [, dd, mm, yyyy, hh, min] = match;
+
+  const date = new Date(
+    Number(yyyy),
+    Number(mm) - 1,
+    Number(dd),
+    Number(hh),
+    Number(min),
+    0,
+    0
+  );
+
+  return date.getTime();
 }
 
 async function uploadBufferToYouGile(buffer, filename) {
@@ -99,6 +154,39 @@ async function uploadBufferToYouGile(buffer, filename) {
   return response.data;
 }
 
+async function downloadUrlToBuffer(fileUrl, refererUrl) {
+  const response = await axios.get(fileUrl, {
+    responseType: "arraybuffer",
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+    timeout: 60000,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+      Referer: refererUrl || "https://bidzaar.com/"
+    }
+  });
+
+  let filename = getFileNameFromUrl(fileUrl);
+
+  const disposition = response.headers["content-disposition"];
+  if (disposition) {
+    const utfMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const simpleMatch = disposition.match(/filename="?([^";]+)"?/i);
+
+    if (utfMatch?.[1]) {
+      filename = decodeURIComponent(utfMatch[1]);
+    } else if (simpleMatch?.[1]) {
+      filename = decodeURIComponent(simpleMatch[1]);
+    }
+  }
+
+  return {
+    buffer: Buffer.from(response.data),
+    filename
+  };
+}
+
 function extractBidzaarDataFromHtml(html, tenderUrl) {
   const $ = cheerio.load(html);
 
@@ -117,7 +205,9 @@ function extractBidzaarDataFromHtml(html, tenderUrl) {
     bodyText.match(/Прием предложений до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i) ||
     bodyText.match(/до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i);
 
-  const publishedMatch = bodyText.match(/Опубликован\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i);
+  const publishedMatch = bodyText.match(
+    /Опубликован\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i
+  );
 
   const locationMatch =
     bodyText.match(/Место поставки\s*(.*?)\s*(Теги|Спецификация по позициям|Правила проведения запроса|Прием предложений до)/i);
@@ -246,7 +336,7 @@ async function parseBidzaarWithBrowser(tenderUrl) {
           json
         });
       } catch {
-        // ignore non-json or already-consumed responses
+        // ignore
       }
     });
 
@@ -273,7 +363,7 @@ async function parseBidzaarWithBrowser(tenderUrl) {
         }
       );
     } catch {
-      // page can still be parsed from whatever loaded
+      // parse whatever loaded
     }
 
     const html = await page.content();
@@ -391,6 +481,157 @@ async function parseBidzaarWithBrowser(tenderUrl) {
   }
 }
 
+function buildTenderDescriptionHtml(tender, uploadedDocs) {
+  const summary = escapeHtml(tender.summary || "Выжимка не сформирована.");
+
+  const docLinks = uploadedDocs.length
+    ? uploadedDocs
+        .map((doc) => {
+          const name = escapeHtml(doc.filename || doc.name || "document");
+          const url = escapeHtml(doc.fullUrl || doc.url || "");
+          return `<a target="_blank" rel="noopener noreferrer" href="${url}">${name}</a>`;
+        })
+        .join("<br>")
+    : "Документы не загружены.";
+
+  const sourceUrl = escapeHtml(tender.sourceUrl || "");
+
+  return [
+    `<p><strong>Выжимка:</strong></p>`,
+    `<p>${summary.replace(/\n/g, "<br>")}</p>`,
+    `<p><strong>Код:</strong> ${escapeHtml(tender.code || "")}</p>`,
+    `<p><strong>Срок подачи:</strong> ${escapeHtml(tender.deadline || "")}</p>`,
+    `<p><strong>Место:</strong> ${escapeHtml(tender.location || "")}</p>`,
+    `<p><strong>Количество позиций:</strong> ${escapeHtml(tender.positionsCount || "")}</p>`,
+    `<p><strong>Документация:</strong><br>${docLinks}</p>`,
+    `<p><strong>Ссылка:</strong> <a target="_blank" rel="noopener noreferrer" href="${sourceUrl}">ссылка</a></p>`
+  ].join("");
+}
+
+async function createYouGileTask(payload) {
+  if (!YOUGILE_TOKEN) {
+    throw new Error("YOUGILE_TOKEN is missing");
+  }
+
+  const response = await axios.post(
+    "https://yougile.com/api-v2/tasks",
+    payload,
+    {
+      headers: {
+        Authorization: `Bearer ${YOUGILE_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 60000
+    }
+  );
+
+  return response.data;
+}
+
+async function createTenderFromUrl({
+  url,
+  columnId,
+  taskType,
+  assigned,
+  color
+}) {
+  const finalColumnId = columnId || DEFAULT_COLUMN_ID;
+
+  if (!finalColumnId) {
+    throw new Error("columnId is required. Pass columnId or set YOUGILE_COLUMN_ID in Render Environment.");
+  }
+
+  const tender = await parseBidzaarWithBrowser(url);
+
+  const uploadedDocs = [];
+
+  for (const doc of tender.documents || []) {
+    try {
+      const downloaded = await downloadUrlToBuffer(doc.url, tender.sourceUrl);
+
+      const filename =
+        doc.name && /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(doc.name)
+          ? doc.name
+          : downloaded.filename;
+
+      const result = await uploadBufferToYouGile(downloaded.buffer, filename);
+
+      uploadedDocs.push({
+        sourceUrl: doc.url,
+        ok: true,
+        name: doc.name,
+        filename,
+        result,
+        url: result?.url,
+        fullUrl: result?.fullUrl
+      });
+    } catch (error) {
+      uploadedDocs.push({
+        sourceUrl: doc.url,
+        ok: false,
+        name: doc.name,
+        error: axiosErrorDetails(error)
+      });
+    }
+  }
+
+  const taskTypeName = taskType || "Город";
+  const taskTypeValue =
+    STICKER_VALUES.taskType[taskTypeName] || STICKER_VALUES.taskType["Город"];
+
+  const stickers = {
+    [STICKERS.platform]: STICKER_VALUES.platform.Bidzaar,
+    [STICKERS.source]: STICKER_VALUES.source["Почта"],
+    [STICKERS.positionsCount]: String(tender.positionsCount || ""),
+    [STICKERS.taskType]: taskTypeValue
+  };
+
+  const deadlineMs = parseRussianDateToMs(tender.deadline);
+
+  const taskPayload = {
+    title: tender.title || "Тендер Bidzaar",
+    columnId: finalColumnId,
+    description: buildTenderDescriptionHtml(
+      tender,
+      uploadedDocs.filter((doc) => doc.ok)
+    ),
+    stickers
+  };
+
+  if (Array.isArray(assigned) && assigned.length > 0) {
+    taskPayload.assigned = assigned;
+  }
+
+  if (color) {
+    taskPayload.color = color;
+  }
+
+  if (deadlineMs) {
+    taskPayload.deadline = {
+      deadline: deadlineMs,
+      startDate: deadlineMs,
+      withTime: true,
+      history: [
+        {
+          deadline: deadlineMs,
+          startDate: deadlineMs,
+          timestamp: Date.now(),
+          notifyBefore: 900000,
+          withTime: true
+        }
+      ]
+    };
+  }
+
+  const task = await createYouGileTask(taskPayload);
+
+  return {
+    tender,
+    uploadedDocs,
+    task
+  };
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
@@ -427,6 +668,51 @@ app.post("/parse-bidzaar", checkProxyKey, async (req, res) => {
     res.status(500).json({
       ok: false,
       error: "Bidzaar parse failed",
+      details
+    });
+  }
+});
+
+app.post("/create-tender-from-url", checkProxyKey, async (req, res) => {
+  try {
+    const tenderUrl = req.body.url;
+
+    if (!tenderUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "Pass url"
+      });
+    }
+
+    if (!/^https:\/\/bidzaar\.com\/app\/process\/light\//i.test(tenderUrl)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Only Bidzaar light tender URLs are supported"
+      });
+    }
+
+    const result = await createTenderFromUrl({
+      url: tenderUrl,
+      columnId: req.body.columnId,
+      taskType: req.body.taskType || req.body.type,
+      assigned: req.body.assigned,
+      color: req.body.color
+    });
+
+    res.json({
+      ok: true,
+      tender: result.tender,
+      uploadedDocs: result.uploadedDocs,
+      task: result.task
+    });
+  } catch (error) {
+    const details = axiosErrorDetails(error);
+
+    console.log("CREATE-TENDER-FROM-URL ERROR", details);
+
+    res.status(500).json({
+      ok: false,
+      error: "Create tender from URL failed",
       details
     });
   }
@@ -481,36 +767,17 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
 
     for (const fileUrl of inputUrls) {
       try {
-        const download = await axios.get(fileUrl, {
-          responseType: "arraybuffer",
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity,
-          timeout: 60000,
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
-          }
-        });
-
-        let filename = getFileNameFromUrl(fileUrl);
-
-        const disposition = download.headers["content-disposition"];
-        if (disposition) {
-          const match = disposition.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
-          if (match && match[1]) {
-            filename = decodeURIComponent(match[1].replace(/"/g, ""));
-          }
-        }
+        const downloaded = await downloadUrlToBuffer(fileUrl);
 
         const result = await uploadBufferToYouGile(
-          Buffer.from(download.data),
-          filename
+          downloaded.buffer,
+          downloaded.filename
         );
 
         uploaded.push({
           sourceUrl: fileUrl,
           ok: true,
-          filename,
+          filename: downloaded.filename,
           result,
           url: result?.url,
           fullUrl: result?.fullUrl
