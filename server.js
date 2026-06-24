@@ -95,12 +95,13 @@ app.post("/upload", checkProxyKey, upload.single("file"), async (req, res) => {
       fullUrl: result?.fullUrl
     });
   } catch (error) {
-    console.log("UPLOAD ERROR", axiosErrorDetails(error));
+    const details = axiosErrorDetails(error);
+    console.log("UPLOAD ERROR", details);
 
     res.status(500).json({
       ok: false,
       error: "Upload failed",
-      details: axiosErrorDetails(error)
+      details
     });
   }
 });
@@ -150,15 +151,17 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
           fullUrl: result?.fullUrl
         });
       } catch (error) {
+        const details = axiosErrorDetails(error);
+
         console.log("UPLOAD-BY-URL ERROR", {
           sourceUrl: fileUrl,
-          ...axiosErrorDetails(error)
+          ...details
         });
 
         uploaded.push({
           sourceUrl: fileUrl,
           ok: false,
-          error: axiosErrorDetails(error)
+          error: details
         });
       }
     }
@@ -169,12 +172,13 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
       uploaded
     });
   } catch (error) {
-    console.log("UPLOAD-BY-URL FATAL ERROR", axiosErrorDetails(error));
+    const details = axiosErrorDetails(error);
+    console.log("UPLOAD-BY-URL FATAL ERROR", details);
 
     res.status(500).json({
       ok: false,
       error: "upload-by-url failed",
-      details: axiosErrorDetails(error)
+      details
     });
   }
 });
