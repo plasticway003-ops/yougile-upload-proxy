@@ -284,7 +284,7 @@ function extractBidzaarDataFromHtml(html, tenderUrl) {
     positionsCount: positionsMatch?.[1] ? Number(positionsMatch[1]) : null,
     summary: summaryParts.join("\n\n"),
     documents: uniqueByUrl(documents),
-    rawTextPreview: bodyText.slice(0, 3000)
+    rawTextPreview: bodyText.slice(0, 1000)
   };
 }
 
@@ -508,6 +508,69 @@ function buildTenderDescriptionHtml(tender, uploadedDocs) {
   ].join("");
 }
 
+async function listYouGileTasksByTitle(title) {
+  if (!YOUGILE_TOKEN) {
+    throw new Error("YOUGILE_TOKEN is missing");
+  }
+
+  if (!title) return [];
+
+  const response = await axios.get("https://yougile.com/api-v2/tasks", {
+    headers: {
+      Authorization: `Bearer ${YOUGILE_TOKEN}`
+    },
+    params: {
+      title,
+      limit: 50,
+      offset: 0,
+      includeDeleted: false
+    },
+    timeout: 60000
+  });
+
+  return response.data?.content || [];
+}
+
+async function findDuplicateTender(tender) {
+  const candidates = [];
+
+  if (tender.code) {
+    candidates.push(...(await listYouGileTasksByTitle(tender.code)));
+  }
+
+  const titleWords = cleanText(tender.title)
+    .split(" ")
+    .filter((word) => word.length > 5)
+    .slice(0, 4)
+    .join(" ");
+
+  if (titleWords) {
+    candidates.push(...(await listYouGileTasksByTitle(titleWords)));
+  }
+
+  const seen = new Set();
+  const unique = [];
+
+  for (const task of candidates) {
+    if (!task.id || seen.has(task.id)) continue;
+    seen.add(task.id);
+    unique.push(task);
+  }
+
+  const sourceUrl = tender.sourceUrl || "";
+  const code = tender.code || "";
+
+  return unique.find((task) => {
+    const title = task.title || "";
+    const description = task.description || "";
+
+    return (
+      (code && (title.includes(code) || description.includes(code))) ||
+      (sourceUrl && description.includes(sourceUrl))
+    );
+  }) || null;
+}
+
 async function createYouGileTask(payload) {
   if (!YOUGILE_TOKEN) {
     throw new Error("YOUGILE_TOKEN is missing");
@@ -528,12 +591,23 @@ async function createYouGileTask(payload) {
   return response.data;
 }
 
+function makeShortTask(task) {
+  return {
+    id: task?.id || "",
+    idTaskProject: task?.idTaskProject || "",
+    idTaskCommon: task?.idTaskCommon || "",
+    title: task?.title || "",
+    columnId: task?.columnId || ""
+  };
+}
+
 async function createTenderFromUrl({
   url,
   columnId,
   taskType,
   assigned,
-  color
+  color,
+  skipDuplicateCheck
 }) {
   const finalColumnId = columnId || DEFAULT_COLUMN_ID;
 
@@ -542,6 +616,20 @@ async function createTenderFromUrl({
   }
 
   const tender = await parseBidzaarWithBrowser(url);
+
+  if (!skipDuplicateCheck) {
+    const duplicate = await findDuplicateTender(tender);
+
+    if (duplicate) {
+      return {
+        status: "duplicate",
+        tender,
+        duplicateTask: duplicate,
+        uploadedDocs: [],
+        task: null
+      };
+    }
+  }
 
   const uploadedDocs = [];
 
@@ -561,7 +649,6 @@ async function createTenderFromUrl({
         ok: true,
         name: doc.name,
         filename,
-        result,
         url: result?.url,
         fullUrl: result?.fullUrl
       });
@@ -626,9 +713,53 @@ async function createTenderFromUrl({
   const task = await createYouGileTask(taskPayload);
 
   return {
+    status: "created",
     tender,
     uploadedDocs,
     task
+  };
+}
+
+function makeCreateTenderShortResponse(result) {
+  const tender = result.tender || {};
+  const uploadedDocs = result.uploadedDocs || [];
+  const successfulFiles = uploadedDocs.filter((doc) => doc.ok);
+  const failedFiles = uploadedDocs.filter((doc) => !doc.ok);
+
+  if (result.status === "duplicate") {
+    return {
+      ok: true,
+      status: "duplicate",
+      message: "Карточка по этому тендеру уже существует. Новая карточка не создана.",
+      duplicateTask: makeShortTask(result.duplicateTask),
+      title: tender.title || "",
+      code: tender.code || "",
+      deadline: tender.deadline || "",
+      sourceUrl: tender.sourceUrl || ""
+    };
+  }
+
+  return {
+    ok: true,
+    status: "created",
+    task: makeShortTask(result.task),
+    title: tender.title || "",
+    code: tender.code || "",
+    deadline: tender.deadline || "",
+    location: tender.location || "",
+    positionsCount: tender.positionsCount || null,
+    sourceUrl: tender.sourceUrl || "",
+    documentsFound: Array.isArray(tender.documents) ? tender.documents.length : 0,
+    documentsUploaded: successfulFiles.length,
+    uploadedFiles: successfulFiles.map((doc) => ({
+      filename: doc.filename || doc.name || "",
+      fullUrl: doc.fullUrl || doc.url || ""
+    })),
+    failedFiles: failedFiles.map((doc) => ({
+      name: doc.name || "",
+      sourceUrl: doc.sourceUrl || "",
+      error: doc.error?.message || "Upload failed"
+    }))
   };
 }
 
@@ -658,7 +789,17 @@ app.post("/parse-bidzaar", checkProxyKey, async (req, res) => {
 
     res.json({
       ok: true,
-      ...data
+      platform: data.platform,
+      sourceUrl: data.sourceUrl,
+      title: data.title,
+      code: data.code,
+      deadline: data.deadline,
+      publishedAt: data.publishedAt,
+      location: data.location,
+      positionsCount: data.positionsCount,
+      summary: data.summary,
+      documents: data.documents,
+      debug: data.debug
     });
   } catch (error) {
     const details = axiosErrorDetails(error);
@@ -696,15 +837,11 @@ app.post("/create-tender-from-url", checkProxyKey, async (req, res) => {
       columnId: req.body.columnId,
       taskType: req.body.taskType || req.body.type,
       assigned: req.body.assigned,
-      color: req.body.color
+      color: req.body.color,
+      skipDuplicateCheck: Boolean(req.body.skipDuplicateCheck)
     });
 
-    res.json({
-      ok: true,
-      tender: result.tender,
-      uploadedDocs: result.uploadedDocs,
-      task: result.task
-    });
+    res.json(makeCreateTenderShortResponse(result));
   } catch (error) {
     const details = axiosErrorDetails(error);
 
@@ -735,7 +872,6 @@ app.post("/upload", checkProxyKey, upload.single("file"), async (req, res) => {
     res.json({
       ok: true,
       filename: req.file.originalname,
-      result,
       url: result?.url,
       fullUrl: result?.fullUrl
     });
@@ -778,7 +914,6 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
           sourceUrl: fileUrl,
           ok: true,
           filename: downloaded.filename,
-          result,
           url: result?.url,
           fullUrl: result?.fullUrl
         });
