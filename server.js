@@ -5,6 +5,7 @@ const multer = require("multer");
 const axios = require("axios");
 const FormData = require("form-data");
 const cheerio = require("cheerio");
+const { chromium } = require("playwright");
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -56,8 +57,8 @@ function absoluteUrl(baseUrl, href) {
 
 function cleanText(value) {
   return String(value || "")
-    .replace(/\s+/g, " ")
     .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -98,27 +99,39 @@ async function uploadBufferToYouGile(buffer, filename) {
   return response.data;
 }
 
-function extractBidzaarData(html, tenderUrl) {
+function extractBidzaarDataFromHtml(html, tenderUrl) {
   const $ = cheerio.load(html);
 
   $("script, style, noscript").remove();
 
-  const pageText = cleanText($("body").text());
-  const lines = pageText
-    .split(/(?=Код:|Описание и документы|Контакты|Место поставки|Теги|Спецификация по позициям|Правила проведения запроса|Прием предложений до|Опубликован)/g)
-    .map(cleanText)
-    .filter(Boolean);
+  const bodyText = cleanText($("body").text());
 
   const title =
     cleanText($("h1").first().text()) ||
     cleanText($("title").text()).replace(/\s*\|\s*Bidzaar.*$/i, "") ||
-    cleanText($("body").text()).split("Код:")[0];
+    "Bidzaar";
 
-  const codeMatch = pageText.match(/Код:\s*([0-9A-Za-zА-Яа-яЁё\-]+)/i);
-  const deadlineMatch = pageText.match(/Прием предложений до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},\s*[0-9]{2}:[0-9]{2})/i);
-  const publishedMatch = pageText.match(/Опубликован\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},\s*[0-9]{2}:[0-9]{2})/i);
-  const locationMatch = pageText.match(/Место поставки\s*(.*?)\s*Теги/i);
-  const positionsMatch = pageText.match(/Спецификация по позициям\s*\((\d+)\)/i);
+  const codeMatch = bodyText.match(/Код:\s*([0-9A-Za-zА-Яа-яЁё\-]+)/i);
+
+  const deadlineMatch =
+    bodyText.match(/Прием предложений до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i) ||
+    bodyText.match(/до\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i);
+
+  const publishedMatch = bodyText.match(/Опубликован\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4},?\s*[0-9]{2}:[0-9]{2})/i);
+
+  const locationMatch =
+    bodyText.match(/Место поставки\s*(.*?)\s*(Теги|Спецификация по позициям|Правила проведения запроса|Прием предложений до)/i);
+
+  const positionsMatch =
+    bodyText.match(/Спецификация по позициям\s*\((\d+)\)/i) ||
+    bodyText.match(/Позици[ияй]\s*\((\d+)\)/i);
+
+  const descriptionMatch =
+    bodyText.match(/Описание и документы\s*(.*?)\s*(Контакты|Место поставки|Теги|Спецификация по позициям|Правила проведения запроса)/i) ||
+    bodyText.match(/Описание\s*(.*?)\s*(Контакты|Место поставки|Теги|Спецификация по позициям|Правила проведения запроса)/i);
+
+  const rulesMatch =
+    bodyText.match(/Правила проведения запроса\s*(.*?)\s*(Прием предложений до|Вид запроса|После подачи|$)/i);
 
   const documents = [];
 
@@ -130,6 +143,7 @@ function extractBidzaarData(html, tenderUrl) {
 
     const isDocumentLink =
       /filestorage\/files\/download/i.test(href) ||
+      /\/api\/.*file/i.test(href) ||
       /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)(\?|$)/i.test(href);
 
     if (!isDocumentLink) return;
@@ -146,14 +160,6 @@ function extractBidzaarData(html, tenderUrl) {
       url: absoluteUrl(tenderUrl, href)
     });
   });
-
-  const descriptionMatch = pageText.match(
-    /Описание и документы\s*(.*?)\s*(Контакты|Место поставки|Теги|Спецификация по позициям)/i
-  );
-
-  const rulesMatch = pageText.match(
-    /Правила проведения запроса\s*(.*?)\s*(Прием предложений до|Вид запроса|После подачи)/i
-  );
 
   const summaryParts = [];
 
@@ -182,14 +188,207 @@ function extractBidzaarData(html, tenderUrl) {
     sourceUrl: tenderUrl,
     title: cleanText(title),
     code: codeMatch?.[1] || "",
-    deadline: deadlineMatch?.[1] || "",
-    publishedAt: publishedMatch?.[1] || "",
+    deadline: deadlineMatch?.[1] ? cleanText(deadlineMatch[1]) : "",
+    publishedAt: publishedMatch?.[1] ? cleanText(publishedMatch[1]) : "",
     location: locationMatch?.[1] ? cleanText(locationMatch[1]) : "",
     positionsCount: positionsMatch?.[1] ? Number(positionsMatch[1]) : null,
     summary: summaryParts.join("\n\n"),
     documents: uniqueByUrl(documents),
-    rawTextPreview: pageText.slice(0, 3000)
+    rawTextPreview: bodyText.slice(0, 3000)
   };
+}
+
+async function parseBidzaarWithBrowser(tenderUrl) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu"
+    ]
+  });
+
+  try {
+    const page = await browser.newPage({
+      viewport: {
+        width: 1366,
+        height: 900
+      },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+    });
+
+    const apiResponses = [];
+
+    page.on("response", async (response) => {
+      const url = response.url();
+
+      if (!url.includes("bidzaar.com")) return;
+
+      const isUsefulApi =
+        url.includes("/api/") ||
+        url.includes("process") ||
+        url.includes("filestorage") ||
+        url.includes("files");
+
+      if (!isUsefulApi) return;
+
+      try {
+        const contentType = response.headers()["content-type"] || "";
+
+        if (!contentType.includes("application/json")) return;
+
+        const json = await response.json();
+
+        apiResponses.push({
+          url,
+          json
+        });
+      } catch {
+        // ignore non-json or already-consumed responses
+      }
+    });
+
+    await page.goto(tenderUrl, {
+      waitUntil: "networkidle",
+      timeout: 60000
+    });
+
+    await page.waitForTimeout(5000);
+
+    try {
+      await page.waitForFunction(
+        () => {
+          const text = document.body.innerText || "";
+          return (
+            text.includes("Описание") ||
+            text.includes("Спецификация") ||
+            text.includes("Прием предложений") ||
+            text.includes("Место поставки")
+          );
+        },
+        {
+          timeout: 20000
+        }
+      );
+    } catch {
+      // page can still be parsed from whatever loaded
+    }
+
+    const html = await page.content();
+
+    const domLinks = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll("a[href]")).map((a) => ({
+        text: (a.innerText || a.textContent || "").trim(),
+        href: a.getAttribute("href")
+      }));
+    });
+
+    const data = extractBidzaarDataFromHtml(html, tenderUrl);
+
+    const apiDocuments = [];
+
+    function scanJsonForDocuments(value) {
+      if (!value || typeof value !== "object") return;
+
+      if (Array.isArray(value)) {
+        for (const item of value) scanJsonForDocuments(item);
+        return;
+      }
+
+      const keys = Object.keys(value);
+
+      const possibleName =
+        value.name ||
+        value.fileName ||
+        value.filename ||
+        value.originalName ||
+        value.title ||
+        value.displayName;
+
+      const possibleUrl =
+        value.url ||
+        value.downloadUrl ||
+        value.fileUrl ||
+        value.href ||
+        value.link;
+
+      const possibleId =
+        value.id ||
+        value.fileId ||
+        value.uuid ||
+        value.guid ||
+        value.storageId;
+
+      const hasFileExtension =
+        typeof possibleName === "string" &&
+        /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(possibleName);
+
+      if (possibleUrl && typeof possibleUrl === "string") {
+        const looksLikeDoc =
+          /filestorage|download|file/i.test(possibleUrl) ||
+          /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)(\?|$)/i.test(possibleUrl) ||
+          hasFileExtension;
+
+        if (looksLikeDoc) {
+          apiDocuments.push({
+            name: cleanText(possibleName || getFileNameFromUrl(possibleUrl) || "document"),
+            url: absoluteUrl(tenderUrl, possibleUrl)
+          });
+        }
+      }
+
+      if (possibleId && possibleName && hasFileExtension) {
+        apiDocuments.push({
+          name: cleanText(possibleName),
+          url: absoluteUrl(
+            tenderUrl,
+            `/api/filestorage/files/download/${possibleId}`
+          )
+        });
+      }
+
+      for (const key of keys) {
+        scanJsonForDocuments(value[key]);
+      }
+    }
+
+    for (const item of apiResponses) {
+      scanJsonForDocuments(item.json);
+    }
+
+    const linkDocuments = domLinks
+      .filter((link) => {
+        const href = link.href || "";
+        const text = link.text || "";
+
+        return (
+          /filestorage\/files\/download/i.test(href) ||
+          /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)(\?|$)/i.test(href) ||
+          /\.(pdf|doc|docx|xls|xlsx|zip|rar|7z|txt)$/i.test(text)
+        );
+      })
+      .map((link) => ({
+        name: cleanText(link.text || getFileNameFromUrl(link.href) || "document"),
+        url: absoluteUrl(tenderUrl, link.href)
+      }));
+
+    data.documents = uniqueByUrl([
+      ...data.documents,
+      ...linkDocuments,
+      ...apiDocuments
+    ]);
+
+    data.debug = {
+      domLinksCount: domLinks.length,
+      apiResponsesCount: apiResponses.length
+    };
+
+    return data;
+  } finally {
+    await browser.close();
+  }
 }
 
 app.get("/health", (req, res) => {
@@ -214,16 +413,7 @@ app.post("/parse-bidzaar", checkProxyKey, async (req, res) => {
       });
     }
 
-    const response = await axios.get(tenderUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-      },
-      timeout: 30000
-    });
-
-    const data = extractBidzaarData(response.data, tenderUrl);
+    const data = await parseBidzaarWithBrowser(tenderUrl);
 
     res.json({
       ok: true,
