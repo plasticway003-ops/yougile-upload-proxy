@@ -11,7 +11,7 @@ app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const APP_VERSION = "bidzaar-parser-v4";
+const APP_VERSION = "bidzaar-parser-v5";
 
 const PROXY_KEY = process.env.PROXY_KEY;
 const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
@@ -442,22 +442,18 @@ function extractCodeFromUrl(sourceUrl) {
   try {
     const parsed = new URL(sourceUrl);
 
-    const utmContent = parsed.searchParams.get("utm_content");
+    const candidates = [
+      parsed.searchParams.get("utm_content"),
+      parsed.searchParams.get("code"),
+      parsed.searchParams.get("number"),
+      parsed.searchParams.get("tenderCode"),
+      parsed.searchParams.get("procedureCode"),
+    ];
 
-    if (isValidTenderCode(utmContent)) {
-      return utmContent.trim();
-    }
-
-    const code = parsed.searchParams.get("code");
-
-    if (isValidTenderCode(code)) {
-      return code.trim();
-    }
-
-    const number = parsed.searchParams.get("number");
-
-    if (isValidTenderCode(number)) {
-      return number.trim();
+    for (const candidate of candidates) {
+      if (isValidTenderCode(candidate)) {
+        return candidate.trim();
+      }
     }
 
     return null;
@@ -980,9 +976,9 @@ async function parseBidzaarTenderPage(url) {
         extractedPageTitle: extractTitleFromPageTitle(domData.pageTitle),
         jsonTitle: jsonTender.jsonTitle,
         company: jsonTender.company,
-        textPreview: domData.text.replace(/\s+/g, " ").trim().slice(0, 250),
+        textPreview: domData.text.replace(/\s+/g, " ").trim().slice(0, 120),
         jsonResponsesCount: jsonResponses.length,
-        sampleUrls: responseUrls.slice(0, 20),
+        sampleUrls: responseUrls.slice(0, 5).map((item) => item.slice(0, 120)),
       },
     };
   } finally {
@@ -1007,7 +1003,7 @@ app.get("/", (req, res) => {
 
 app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
   try {
-    const { url } = req.body || {};
+    const { url, debug = false } = req.body || {};
 
     if (!url) {
       return res.status(400).json({
@@ -1019,7 +1015,7 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
 
     const tender = await parseBidzaarTenderPage(url);
 
-    return res.json({
+    const response = {
       ok: true,
       version: APP_VERSION,
       tender: {
@@ -1028,13 +1024,25 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
         documentsCount: tender.documents.length,
-        documentsPreview: tender.documents.slice(0, 10).map((doc) => ({
-          name: doc.name,
-          url: doc.url,
-        })),
       },
-      diagnostics: tender.diagnostics,
-    });
+      diagnostics: {
+        pageTitle: tender.diagnostics?.pageTitle || null,
+        extractedPageTitle: tender.diagnostics?.extractedPageTitle || null,
+        jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
+        company: tender.diagnostics?.company || null,
+        jsonTitle: tender.diagnostics?.jsonTitle || null,
+      },
+    };
+
+    if (debug === true) {
+      response.debug = {
+        textPreview: tender.diagnostics?.textPreview || null,
+        sampleUrls: tender.diagnostics?.sampleUrls || [],
+        documentsNames: tender.documents.slice(0, 10).map((doc) => doc.name),
+      };
+    }
+
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({
       ok: false,
