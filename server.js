@@ -11,7 +11,7 @@ app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const APP_VERSION = "bidzaar-parser-v3";
+const APP_VERSION = "bidzaar-parser-v4";
 
 const PROXY_KEY = process.env.PROXY_KEY;
 const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
@@ -414,6 +414,175 @@ function normalizeDocUrl(url, sourceUrl) {
   }
 }
 
+function isBadPlaceholder(value) {
+  const raw = String(value || "").trim().toLowerCase();
+
+  if (!raw) return true;
+
+  return (
+    raw.includes("укажите") ||
+    raw.includes("введите") ||
+    raw.includes("заполните") ||
+    raw.includes("select") ||
+    raw.includes("choose") ||
+    raw.includes("placeholder")
+  );
+}
+
+function isValidTenderCode(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw) return false;
+  if (isBadPlaceholder(raw)) return false;
+
+  return /^\d{2,}[-/]\d{2,}$/.test(raw) || /^[A-ZА-Я0-9]{2,}[-/]\d{2,}$/i.test(raw);
+}
+
+function extractCodeFromUrl(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+
+    const utmContent = parsed.searchParams.get("utm_content");
+
+    if (isValidTenderCode(utmContent)) {
+      return utmContent.trim();
+    }
+
+    const code = parsed.searchParams.get("code");
+
+    if (isValidTenderCode(code)) {
+      return code.trim();
+    }
+
+    const number = parsed.searchParams.get("number");
+
+    if (isValidTenderCode(number)) {
+      return number.trim();
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTitleFromPageTitle(pageTitle) {
+  const raw = String(pageTitle || "").replace(/\s+/g, " ").trim();
+
+  if (!raw) return null;
+
+  const bidzaarMatch = raw.match(/^Тендер\s*\|\s*(.*?)\s*\|\s*Bidzaar$/i);
+
+  if (bidzaarMatch?.[1]) {
+    const title = bidzaarMatch[1].trim();
+
+    if (title && !isBadPlaceholder(title)) {
+      return title;
+    }
+  }
+
+  if (raw && raw.toLowerCase() !== "bidzaar" && !isBadPlaceholder(raw)) {
+    return raw;
+  }
+
+  return null;
+}
+
+function looksLikeCompany(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw) return false;
+  if (raw.length < 2 || raw.length > 120) return false;
+  if (isBadPlaceholder(raw)) return false;
+
+  const lower = raw.toLowerCase();
+
+  if (
+    lower.includes("ооо") ||
+    lower.includes("ао ") ||
+    lower.includes("пао") ||
+    lower.includes("зао") ||
+    lower.includes("ип ") ||
+    lower.includes("кордиант") ||
+    lower.includes("megafon") ||
+    lower.includes("мегафон") ||
+    lower.includes("билайн")
+  ) {
+    return true;
+  }
+
+  return /^[А-ЯA-Z0-9 «»"()._-]{3,}$/.test(raw);
+}
+
+function normalizeCompanyName(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/^Компания\s*[:\-]?\s*/i, "")
+    .replace(/^Заказчик\s*[:\-]?\s*/i, "")
+    .trim();
+}
+
+function extractCompanyFromJsonObjects(objects) {
+  const companyKeys = [
+    "company",
+    "companyName",
+    "customer",
+    "customerName",
+    "client",
+    "clientName",
+    "organizer",
+    "organizerName",
+    "organization",
+    "organizationName",
+    "buyer",
+    "buyerName",
+    "ownerName",
+  ];
+
+  const candidates = [];
+
+  for (const obj of objects) {
+    const candidate = pickFirstString(obj, companyKeys);
+
+    if (candidate && looksLikeCompany(candidate)) {
+      candidates.push(normalizeCompanyName(candidate));
+    }
+  }
+
+  const unique = [...new Set(candidates)];
+
+  const strong = unique.find((item) =>
+    /кордиант|ооо|пао|ао |зао|ип |мегафон|билайн/i.test(item),
+  );
+
+  return strong || unique[0] || null;
+}
+
+function buildFinalTitle({ pageTitle, jsonTitle, company }) {
+  const titleFromPage = extractTitleFromPageTitle(pageTitle);
+
+  const cleanJsonTitle =
+    jsonTitle && !isBadPlaceholder(jsonTitle) && jsonTitle.toLowerCase() !== "bidzaar"
+      ? jsonTitle.trim()
+      : null;
+
+  const baseTitle = titleFromPage || cleanJsonTitle || "Тендер Bidzaar";
+
+  if (company && !baseTitle.toLowerCase().includes(company.toLowerCase())) {
+    return `${company} (${baseTitle})`;
+  }
+
+  if (baseTitle === "Тендер Bidzaar") {
+    return baseTitle;
+  }
+
+  if (/^тендер/i.test(baseTitle)) {
+    return baseTitle;
+  }
+
+  return `Тендер | ${baseTitle}`;
+}
+
 function extractDocumentsFromJsonObjects(objects, sourceUrl) {
   const docs = [];
   const seen = new Set();
@@ -502,28 +671,30 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
     flattenJson(response.json, allObjects);
   }
 
-  let title = null;
-  let code = null;
+  let jsonTitle = null;
+  let code = extractCodeFromUrl(sourceUrl);
   let deadline = null;
   let positionsCount = null;
 
   const titleKeys = [
-    "title",
-    "name",
-    "subject",
     "procedureName",
     "processName",
     "tenderName",
     "lotName",
+    "subject",
+    "title",
+    "name",
   ];
 
-  const codeKeys = [
-    "code",
-    "number",
+  const strictCodeKeys = [
+    "procedureCode",
+    "tenderCode",
+    "processCode",
+    "codeNumber",
     "procedureNumber",
     "processNumber",
     "tenderNumber",
-    "externalId",
+    "publicNumber",
     "publicId",
   ];
 
@@ -549,23 +720,28 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
   ];
 
   for (const obj of allObjects) {
-    if (!title) {
+    if (!jsonTitle) {
       const maybeTitle = pickFirstString(obj, titleKeys);
 
       if (
         maybeTitle &&
         maybeTitle.length > 5 &&
-        !["bidzaar", "menu", "home"].includes(maybeTitle.toLowerCase())
+        maybeTitle.length < 300 &&
+        !isBadPlaceholder(maybeTitle) &&
+        !["bidzaar", "menu", "home", "бейджи"].includes(maybeTitle.toLowerCase())
       ) {
-        title = maybeTitle;
+        jsonTitle = maybeTitle;
       }
     }
 
     if (!code) {
-      const maybeCode = pickFirstString(obj, codeKeys);
+      for (const key of strictCodeKeys) {
+        const maybeCode = obj?.[key];
 
-      if (maybeCode && maybeCode.length <= 50) {
-        code = maybeCode;
+        if (isValidTenderCode(maybeCode)) {
+          code = String(maybeCode).trim();
+          break;
+        }
       }
     }
 
@@ -589,10 +765,12 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
     }
   }
 
+  const company = extractCompanyFromJsonObjects(allObjects);
   const documents = extractDocumentsFromJsonObjects(allObjects, sourceUrl);
 
   return {
-    title,
+    jsonTitle,
+    company,
     code,
     deadline,
     positionsCount,
@@ -600,12 +778,15 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
   };
 }
 
-function extractTenderFromText(text) {
+function extractTenderFromText(text, sourceUrl) {
   const safeText = String(text || "");
 
   const codeMatch =
-    safeText.match(/код[:\s№-]*([0-9]{2,}[-/][0-9]{2,})/i) ||
-    safeText.match(/№[:\s]*([0-9]{2,}[-/][0-9]{2,})/i);
+    safeText.match(/\b(\d{2,}[-/]\d{2,})\b/) ||
+    safeText.match(/код[:\s№-]*(\d{2,}[-/]\d{2,})/i) ||
+    safeText.match(/№[:\s]*(\d{2,}[-/]\d{2,})/i);
+
+  const urlCode = extractCodeFromUrl(sourceUrl);
 
   const deadlineMatch =
     safeText.match(
@@ -617,7 +798,7 @@ function extractTenderFromText(text) {
     safeText.match(/лотов[^\d]{0,20}(\d+)/i);
 
   return {
-    code: codeMatch?.[1] || null,
+    code: urlCode || codeMatch?.[1] || null,
     deadline: deadlineMatch?.[2] || deadlineMatch?.[1] || null,
     positionsCount: positionsMatch ? Number(positionsMatch[1]) : null,
   };
@@ -672,7 +853,7 @@ async function parseBidzaarTenderPage(url) {
           });
         }
       } catch {
-        // молча пропускаем не-JSON / закрытые ответы
+        // пропускаем закрытые и не-JSON ответы
       }
     });
 
@@ -744,15 +925,14 @@ async function parseBidzaarTenderPage(url) {
       };
     });
 
-    const textTender = extractTenderFromText(domData.text);
+    const textTender = extractTenderFromText(domData.text, url);
     const jsonTender = extractTenderFromJsonResponses(jsonResponses, url);
 
-    const title =
-      jsonTender.title ||
-      (domData.pageTitle && domData.pageTitle !== "Bidzaar"
-        ? domData.pageTitle
-        : null) ||
-      "Bidzaar";
+    const title = buildFinalTitle({
+      pageTitle: domData.pageTitle,
+      jsonTitle: jsonTender.jsonTitle,
+      company: jsonTender.company,
+    });
 
     const code = jsonTender.code || textTender.code || null;
     const deadline = jsonTender.deadline || textTender.deadline || null;
@@ -797,6 +977,9 @@ async function parseBidzaarTenderPage(url) {
       sourceUrl: url,
       diagnostics: {
         pageTitle: domData.pageTitle,
+        extractedPageTitle: extractTitleFromPageTitle(domData.pageTitle),
+        jsonTitle: jsonTender.jsonTitle,
+        company: jsonTender.company,
         textPreview: domData.text.replace(/\s+/g, " ").trim().slice(0, 250),
         jsonResponsesCount: jsonResponses.length,
         sampleUrls: responseUrls.slice(0, 20),
@@ -1016,6 +1199,8 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
       parser: {
         jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
         pageTitle: tender.diagnostics?.pageTitle || null,
+        extractedPageTitle: tender.diagnostics?.extractedPageTitle || null,
+        company: tender.diagnostics?.company || null,
       },
       usedColumnId: columnId,
       actualColumnId: fullTask?.columnId || null,
