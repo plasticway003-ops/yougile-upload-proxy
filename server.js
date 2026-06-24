@@ -11,6 +11,8 @@ app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
 
+const APP_VERSION = "compact-response-v2";
+
 const PROXY_KEY = process.env.PROXY_KEY;
 const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
 const YOUGILE_BASE_URL = process.env.YOUGILE_BASE_URL || "https://ru.yougile.com";
@@ -175,15 +177,13 @@ function makeStickers({ taskType = "Город", positionsCount = 0 } = {}) {
   };
 }
 
-function makeShortTask(fullTask) {
-  if (!fullTask) return null;
-
+function makeShortTask(fullTask, fallback = {}) {
   return {
-    id: fullTask.id || null,
-    idTaskProject: fullTask.idTaskProject || null,
-    idTaskCommon: fullTask.idTaskCommon || null,
-    title: fullTask.title || null,
-    columnId: fullTask.columnId || null,
+    id: fullTask?.id || fallback.id || null,
+    idTaskProject: fullTask?.idTaskProject || null,
+    idTaskCommon: fullTask?.idTaskCommon || null,
+    title: fullTask?.title || fallback.title || null,
+    columnId: fullTask?.columnId || null,
   };
 }
 
@@ -324,21 +324,6 @@ function getCreatedTaskId(createdResponse) {
   );
 }
 
-function compactUploadErrors(uploadErrors) {
-  return uploadErrors.slice(0, 5).map((item) => ({
-    name: normalizeDocumentName(item.name),
-    url: item.url,
-    error: item.error,
-  }));
-}
-
-function compactUploadedDocuments(uploadedDocuments) {
-  return uploadedDocuments.slice(0, 20).map((doc) => ({
-    name: normalizeDocumentName(doc.name),
-    yougileUrl: doc.yougileUrl,
-  }));
-}
-
 async function parseBidzaarTenderPage(url) {
   let browser;
 
@@ -458,6 +443,7 @@ async function parseBidzaarTenderPage(url) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
+    version: APP_VERSION,
     service: "yougile-upload-proxy",
     endpoints: [
       "POST /parse-bidzaar",
@@ -482,22 +468,19 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
 
     return res.json({
       ok: true,
+      version: APP_VERSION,
       tender: {
         title: tender.title,
         code: tender.code,
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
-        sourceUrl: tender.sourceUrl,
         documentsCount: tender.documents.length,
-        documents: tender.documents.slice(0, 20).map((doc) => ({
-          name: normalizeDocumentName(doc.name),
-          url: doc.url,
-        })),
       },
     });
   } catch (error) {
     return res.status(500).json({
       ok: false,
+      version: APP_VERSION,
       error: error.message,
     });
   }
@@ -512,36 +495,33 @@ app.post("/upload-by-url", requireProxyKey, async (req, res) => {
     if (!items.length) {
       return res.status(400).json({
         ok: false,
+        version: APP_VERSION,
         error: "url or urls is required",
       });
     }
 
-    const uploaded = [];
-    const errors = [];
+    let uploadedCount = 0;
+    let errorCount = 0;
 
     for (const itemUrl of items) {
       try {
-        const result = await uploadTenderFileByUrl(itemUrl);
-        uploaded.push({
-          name: result.name,
-          yougileUrl: result.yougileUrl,
-        });
-      } catch (error) {
-        errors.push({
-          url: itemUrl,
-          error: error.message,
-        });
+        await uploadTenderFileByUrl(itemUrl);
+        uploadedCount += 1;
+      } catch {
+        errorCount += 1;
       }
     }
 
     return res.json({
-      ok: errors.length === 0,
-      uploaded,
-      errors,
+      ok: errorCount === 0,
+      version: APP_VERSION,
+      uploaded: uploadedCount,
+      errors: errorCount,
     });
   } catch (error) {
     return res.status(500).json({
       ok: false,
+      version: APP_VERSION,
       error: error.message,
     });
   }
@@ -556,12 +536,12 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
       type,
       assigned = [],
       color,
-      debug = false,
     } = req.body || {};
 
     if (!url) {
       return res.status(400).json({
         ok: false,
+        version: APP_VERSION,
         error: "url is required",
       });
     }
@@ -571,6 +551,7 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
     if (!columnId) {
       return res.status(400).json({
         ok: false,
+        version: APP_VERSION,
         error:
           "columnId is required. Pass columnId in body or set YOUGILE_COLUMN_ID env.",
       });
@@ -579,7 +560,7 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
     const tender = await parseBidzaarTenderPage(url);
 
     const uploadedDocuments = [];
-    const uploadErrors = [];
+    let uploadErrorCount = 0;
 
     for (const doc of tender.documents || []) {
       try {
@@ -589,12 +570,8 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
         );
 
         uploadedDocuments.push(uploaded);
-      } catch (error) {
-        uploadErrors.push({
-          name: normalizeDocumentName(doc.name),
-          url: doc.url,
-          error: error.message,
-        });
+      } catch {
+        uploadErrorCount += 1;
       }
     }
 
@@ -635,53 +612,45 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
     if (!createdTaskId) {
       return res.status(500).json({
         ok: false,
+        version: APP_VERSION,
         error: "Task created, but created task id was not found in YouGile response",
-        createdTaskPreview: JSON.stringify(createdTask).slice(0, 1000),
       });
     }
 
     const fullTask = await getYouGileTaskByIdApi(createdTaskId);
-    const shortTask = makeShortTask(fullTask);
+    const shortTask = makeShortTask(fullTask, {
+      id: createdTaskId,
+      title,
+    });
 
-    const compactResponse = {
+    return res.json({
       ok: true,
+      version: APP_VERSION,
       task: shortTask,
       tender: {
         title: tender.title,
         code: tender.code,
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
-        sourceUrl: tender.sourceUrl,
       },
       documents: {
         total: tender.documents?.length || 0,
         uploaded: uploadedDocuments.length,
-        errors: uploadErrors.length,
-        uploadErrors: compactUploadErrors(uploadErrors),
+        errors: uploadErrorCount,
       },
       usedColumnId: columnId,
       actualColumnId: fullTask?.columnId || null,
-    };
-
-    if (debug === true) {
-      compactResponse.debug = {
-        createdTaskId,
-        createdTaskPreview: JSON.stringify(createdTask).slice(0, 1000),
-        fullTask: shortTask,
-        uploadedDocuments: compactUploadedDocuments(uploadedDocuments),
-      };
-    }
-
-    return res.json(compactResponse);
+    });
   } catch (error) {
     return res.status(500).json({
       ok: false,
+      version: APP_VERSION,
       error: error.message,
-      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
     });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`YouGile proxy is running on port ${PORT}`);
+  console.log(`Version: ${APP_VERSION}`);
 });
