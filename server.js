@@ -11,11 +11,11 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
-const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
-const PROXY_KEY = process.env.PROXY_KEY;
+const YOUGILE_TOKEN = (process.env.YOUGILE_TOKEN || "").trim();
+const PROXY_KEY = (process.env.PROXY_KEY || "").trim();
 
 function checkProxyKey(req, res, next) {
-  const key = req.header("x-proxy-key");
+  const key = (req.header("x-proxy-key") || "").trim();
 
   if (!PROXY_KEY || key !== PROXY_KEY) {
     return res.status(401).json({
@@ -37,6 +37,14 @@ function getFileNameFromUrl(fileUrl) {
   }
 }
 
+function axiosErrorDetails(error) {
+  return {
+    message: error.message,
+    status: error.response?.status,
+    data: error.response?.data
+  };
+}
+
 async function uploadBufferToYouGile(buffer, filename) {
   if (!YOUGILE_TOKEN) {
     throw new Error("YOUGILE_TOKEN is missing");
@@ -46,7 +54,7 @@ async function uploadBufferToYouGile(buffer, filename) {
   form.append("file", buffer, filename);
 
   const response = await axios.post(
-    "https://yougile.com/api-v2/files/upload",
+    "https://yougile.com/api-v2/upload-file",
     form,
     {
       headers: {
@@ -83,14 +91,16 @@ app.post("/upload", checkProxyKey, upload.single("file"), async (req, res) => {
       ok: true,
       filename: req.file.originalname,
       result,
-      urls: result?.urls,
-      fullUrls: result?.fullUrls
+      url: result?.url,
+      fullUrl: result?.fullUrl
     });
   } catch (error) {
+    console.log("UPLOAD ERROR", axiosErrorDetails(error));
+
     res.status(500).json({
       ok: false,
       error: "Upload failed",
-      details: error.message
+      details: axiosErrorDetails(error)
     });
   }
 });
@@ -136,14 +146,19 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
           ok: true,
           filename,
           result,
-          urls: result?.urls,
-          fullUrls: result?.fullUrls
+          url: result?.url,
+          fullUrl: result?.fullUrl
         });
       } catch (error) {
+        console.log("UPLOAD-BY-URL ERROR", {
+          sourceUrl: fileUrl,
+          ...axiosErrorDetails(error)
+        });
+
         uploaded.push({
           sourceUrl: fileUrl,
           ok: false,
-          error: error.message
+          error: axiosErrorDetails(error)
         });
       }
     }
@@ -154,10 +169,12 @@ app.post("/upload-by-url", checkProxyKey, async (req, res) => {
       uploaded
     });
   } catch (error) {
+    console.log("UPLOAD-BY-URL FATAL ERROR", axiosErrorDetails(error));
+
     res.status(500).json({
       ok: false,
       error: "upload-by-url failed",
-      details: error.message
+      details: axiosErrorDetails(error)
     });
   }
 });
