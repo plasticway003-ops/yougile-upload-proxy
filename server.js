@@ -647,18 +647,7 @@ function mergeDocuments(...lists) {
   }
 
   return result;
-}
-function extractCodeFromUrl(sourceUrl) {
-  try {
-    const parsed = new URL(sourceUrl);
-
-    const candidates = [
-      parsed.searchParams.get("utm_content"),
-      parsed.searchParams.get("code"),
-      parsed.searchParams.get("number"),
-      parsed.searchParams.get("tenderCode"),
-      parsed.searchParams.get("procedureCode"),
-    ];
+};
 
     for (const candidate of candidates) {
       if (isValidTenderCode(candidate)) {
