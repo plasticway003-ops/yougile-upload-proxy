@@ -89,6 +89,8 @@ function htmlEscape(value) {
 
 function stripHtml(value) {
   return String(value ?? "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -124,6 +126,7 @@ function flattenJson(value, result = [], depth = 0) {
     for (const item of value) {
       flattenJson(item, result, depth + 1);
     }
+
     return result;
   }
 
@@ -245,10 +248,78 @@ function isDocumentUrlOrName(value) {
   );
 }
 
+function looksLikeCaptchaOrAntibot(text) {
+  const raw = String(text || "").toLowerCase();
+
+  return (
+    raw.includes("are you not a robot") ||
+    raw.includes("are you a robot") ||
+    raw.includes("not a robot") ||
+    raw.includes("smart-captcha") ||
+    raw.includes("checkbox-captcha") ||
+    raw.includes("advanced-captcha") ||
+    raw.includes("captcha-backgrounds") ||
+    raw.includes("cloudlogo.svg") ||
+    raw.includes("captcha") ||
+    (raw.includes("yandex") && raw.includes("robot")) ||
+    (raw.includes("яндекс") && raw.includes("робот"))
+  );
+}
+
+function looksLikeCssOrUiTrash(text) {
+  const raw = String(text || "").toLowerCase();
+
+  return (
+    raw.includes("@media") ||
+    raw.includes("prefers-color-scheme") ||
+    raw.includes("background-image:url") ||
+    raw.includes("--smart-captcha") ||
+    raw.includes("rgba(") ||
+    raw.includes("border-radius") ||
+    raw.includes("font-family") ||
+    raw.includes("stylesheet") ||
+    raw.includes("javascript") ||
+    raw.includes("webpack") ||
+    raw.includes("__next_data__") ||
+    raw.includes("cdn.yandex.net") ||
+    raw.includes("svc.cdn.yandex.net")
+  );
+}
+
+function cleanSummaryText(text) {
+  const source = String(text || "");
+
+  if (!source.trim()) return "";
+
+  if (looksLikeCaptchaOrAntibot(source) || looksLikeCssOrUiTrash(source)) {
+    return "";
+  }
+
+  const raw = stripHtml(source)
+    .replace(/\b(Войти|Регистрация|Личный кабинет|Главная|Меню|Назад|Далее)\b/gi, " ")
+    .replace(/\b(Are you not a robot|Are you a robot|not a robot|captcha|SmartCaptcha)\b/gi, " ")
+    .replace(/@media[^{]*\{[^}]*\}/gi, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\{[^{}]{50,}\}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!raw) return "";
+
+  if (looksLikeCaptchaOrAntibot(raw) || looksLikeCssOrUiTrash(raw)) {
+    return "";
+  }
+
+  if (raw.length < 20) return "";
+
+  return raw.slice(0, 1200);
+}
+
 function extractTitleFromPageTitle(pageTitle) {
   const raw = String(pageTitle || "").replace(/\s+/g, " ").trim();
 
   if (!raw) return null;
+  if (looksLikeCaptchaOrAntibot(raw) || looksLikeCssOrUiTrash(raw)) return null;
 
   const bidzaarMatch = raw.match(/^Тендер\s*\|\s*(.*?)\s*\|\s*Bidzaar$/i);
 
@@ -273,6 +344,7 @@ function looksLikeCompany(value) {
   if (!raw) return false;
   if (raw.length < 2 || raw.length > 140) return false;
   if (isBadPlaceholder(raw)) return false;
+  if (looksLikeCaptchaOrAntibot(raw) || looksLikeCssOrUiTrash(raw)) return false;
 
   const lower = raw.toLowerCase();
 
@@ -342,7 +414,11 @@ function buildFinalTitle({ pageTitle, jsonTitle, company }) {
   const titleFromPage = extractTitleFromPageTitle(pageTitle);
 
   const cleanJsonTitle =
-    jsonTitle && !isBadPlaceholder(jsonTitle) && jsonTitle.length > 5
+    jsonTitle &&
+    !isBadPlaceholder(jsonTitle) &&
+    !looksLikeCaptchaOrAntibot(jsonTitle) &&
+    !looksLikeCssOrUiTrash(jsonTitle) &&
+    jsonTitle.length > 5
       ? jsonTitle.trim()
       : null;
 
@@ -468,36 +544,32 @@ function makeShortTask(fullTask, fallback = {}) {
   };
 }
 
-function cleanSummaryText(text) {
-  const raw = stripHtml(text)
-    .replace(/\b(Войти|Регистрация|Личный кабинет|Главная|Меню|Назад|Далее)\b/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!raw) return "";
-
-  return raw.slice(0, 1200);
-}
-
 function buildSummary({ pageSummary, documentSummaries }) {
   const docText = documentSummaries
     .map((doc) => doc.summary)
     .filter(Boolean)
     .join(" ");
 
-  const base = cleanSummaryText(docText || pageSummary);
+  const cleanDocText = cleanSummaryText(docText);
 
-  if (!base) {
-    return "Данные автоматически перенесены из Bidzaar. Подробности во вложенных документах.";
+  if (cleanDocText) {
+    return cleanDocText;
   }
 
-  return base;
+  const cleanPageText = cleanSummaryText(pageSummary);
+
+  if (cleanPageText) {
+    return cleanPageText;
+  }
+
+  return "";
 }
 
 function makeDescription({ summary, documents = [], sourceUrl, preliminaryReason }) {
-  const safeSummary = htmlEscape(
-    summary || "Данные автоматически перенесены из Bidzaar. Подробности во вложениях.",
-  );
+  const finalSummary =
+    summary || "Выжимку не удалось сформировать автоматически. Проверьте вложения вручную.";
+
+  const safeSummary = htmlEscape(finalSummary);
 
   const docsHtml = documents.length
     ? documents
@@ -602,7 +674,10 @@ async function downloadFileByUrl(url, filename) {
     timeout: 120000,
     maxRedirects: 10,
     headers: {
-      "User-Agent": "Mozilla/5.0",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+      Accept:
+        "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/msword,application/vnd.ms-excel,application/zip,*/*",
     },
   });
 
@@ -833,6 +908,8 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
         maybeTitle.length > 5 &&
         maybeTitle.length < 300 &&
         !isBadPlaceholder(maybeTitle) &&
+        !looksLikeCaptchaOrAntibot(maybeTitle) &&
+        !looksLikeCssOrUiTrash(maybeTitle) &&
         !["bidzaar", "menu", "home", "бейджи"].includes(maybeTitle.toLowerCase())
       ) {
         jsonTitle = maybeTitle;
@@ -886,6 +963,14 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
 function extractTenderFromText(text, sourceUrl) {
   const safeText = String(text || "");
 
+  if (looksLikeCaptchaOrAntibot(safeText) || looksLikeCssOrUiTrash(safeText)) {
+    return {
+      code: extractCodeFromUrl(sourceUrl),
+      deadline: null,
+      positionsCount: null,
+    };
+  }
+
   const codeMatch =
     safeText.match(/\b(\d{2,}[-/]\d{2,})\b/) ||
     safeText.match(/код[:\s№-]*(\d{2,}[-/]\d{2,})/i) ||
@@ -930,6 +1015,10 @@ async function parseBidzaarTenderPage(url) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     });
 
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    });
+
     page.on("response", async (response) => {
       try {
         const responseUrl = response.url();
@@ -967,20 +1056,25 @@ async function parseBidzaarTenderPage(url) {
       timeout: 90000,
     });
 
-    await page.waitForLoadState("networkidle", {
-      timeout: 45000,
-    }).catch(() => null);
+    await page
+      .waitForLoadState("networkidle", {
+        timeout: 45000,
+      })
+      .catch(() => null);
 
     await page.waitForTimeout(7000);
 
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight);
-    }).catch(() => null);
+    await page
+      .evaluate(() => {
+        window.scrollTo(0, document.body.scrollHeight);
+      })
+      .catch(() => null);
 
     await page.waitForTimeout(3000);
 
     const domData = await page.evaluate(() => {
       const text = document.body?.innerText || "";
+      const html = document.documentElement?.innerHTML || "";
 
       const pageTitle =
         document.querySelector("h1")?.innerText?.trim() ||
@@ -1027,15 +1121,24 @@ async function parseBidzaarTenderPage(url) {
       return {
         pageTitle,
         text,
+        html,
         documents,
       };
     });
 
-    const textTender = extractTenderFromText(domData.text, url);
+    const pageIsCaptcha =
+      looksLikeCaptchaOrAntibot(domData.text) ||
+      looksLikeCaptchaOrAntibot(domData.html) ||
+      looksLikeCssOrUiTrash(domData.text) ||
+      looksLikeCssOrUiTrash(domData.html);
+
+    const safePageText = pageIsCaptcha ? "" : domData.text;
+
+    const textTender = extractTenderFromText(safePageText, url);
     const jsonTender = extractTenderFromJsonResponses(jsonResponses, url);
 
     const title = buildFinalTitle({
-      pageTitle: domData.pageTitle,
+      pageTitle: pageIsCaptcha ? "" : domData.pageTitle,
       jsonTitle: jsonTender.jsonTitle,
       company: jsonTender.company,
     });
@@ -1043,12 +1146,14 @@ async function parseBidzaarTenderPage(url) {
     const code = jsonTender.code || textTender.code || null;
     const deadline = jsonTender.deadline || textTender.deadline || null;
 
-    const domDocuments = domData.documents.map((doc, index) => ({
-      name: normalizeDocumentName(
-        doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
-      ),
-      url: doc.url,
-    }));
+    const domDocuments = pageIsCaptcha
+      ? []
+      : domData.documents.map((doc, index) => ({
+          name: normalizeDocumentName(
+            doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
+          ),
+          url: doc.url,
+        }));
 
     const documents = [];
     const seenDocs = new Set();
@@ -1076,7 +1181,7 @@ async function parseBidzaarTenderPage(url) {
     const positionsCount =
       jsonTender.positionsCount || textTender.positionsCount || documents.length || 0;
 
-    const pageSummary = cleanSummaryText(domData.text);
+    const pageSummary = pageIsCaptcha ? "" : cleanSummaryText(domData.text);
 
     return {
       title,
@@ -1084,15 +1189,17 @@ async function parseBidzaarTenderPage(url) {
       deadline,
       positionsCount,
       pageSummary,
+      pageIsCaptcha,
       documents,
       sourceUrl: url,
       diagnostics: {
         pageTitle: domData.pageTitle,
-        extractedPageTitle: extractTitleFromPageTitle(domData.pageTitle),
+        extractedPageTitle: pageIsCaptcha ? null : extractTitleFromPageTitle(domData.pageTitle),
         jsonTitle: jsonTender.jsonTitle,
         company: jsonTender.company,
         jsonResponsesCount: jsonResponses.length,
         responseUrlsCount: responseUrls.length,
+        pageIsCaptcha,
       },
     };
   } finally {
@@ -1111,6 +1218,7 @@ function makeCompactParseResponse(tender) {
     deadline: tender.deadline || null,
     positionsCount: tender.positionsCount || 0,
     documentsCount: tender.documents?.length || 0,
+    pageIsCaptcha: Boolean(tender.pageIsCaptcha),
     pageTitle: tender.diagnostics?.pageTitle || null,
     jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
   };
@@ -1130,6 +1238,7 @@ app.get("/", (req, res) => {
     ok: true,
     version: APP_VERSION,
     service: "yougile-upload-proxy",
+    defaultColumnId: YOUGILE_COLUMN_ID,
     endpoints: [
       "POST /parse-bidzaar",
       "POST /parse-bidzaar-compact",
@@ -1187,6 +1296,7 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
         positionsCount: tender.positionsCount,
         documentsCount: tender.documents.length,
         pageSummary: tender.pageSummary,
+        pageIsCaptcha: tender.pageIsCaptcha,
       },
       diagnostics: {
         pageTitle: tender.diagnostics?.pageTitle || null,
@@ -1194,6 +1304,7 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
         jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
         company: tender.diagnostics?.company || null,
         jsonTitle: tender.diagnostics?.jsonTitle || null,
+        pageIsCaptcha: tender.diagnostics?.pageIsCaptcha || false,
       },
     });
   } catch (error) {
@@ -1313,10 +1424,16 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
       }
     }
 
+    const summary = buildSummary({
+      pageSummary: tender.pageSummary,
+      documentSummaries,
+    });
+
     const docsProcessed =
       uploadedDocuments.length > 0 &&
       uploadErrorCount === 0 &&
-      parsedDocumentsCount > 0;
+      parsedDocumentsCount > 0 &&
+      Boolean(summary);
 
     const noDocsFound = !tender.documents?.length;
     const noDocsParsed = uploadedDocuments.length > 0 && parsedDocumentsCount === 0;
@@ -1324,13 +1441,19 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
 
     let preliminaryReason = "";
 
-    if (noDocsFound) {
+    if (tender.pageIsCaptcha) {
+      preliminaryReason =
+        "Bidzaar отдал антибот-страницу/Captcha. Текст страницы не использован в выжимке.";
+    } else if (noDocsFound) {
       preliminaryReason = "Документы в Bidzaar не найдены или недоступны для скачивания.";
     } else if (hasUploadErrors) {
       preliminaryReason = "Не все документы удалось скачать или загрузить в YouGile.";
     } else if (noDocsParsed) {
       preliminaryReason =
         "Документы загружены, но текст из них не удалось извлечь. Проверьте вложения вручную.";
+    } else if (!summary) {
+      preliminaryReason =
+        "Не удалось получить чистую выжимку. Captcha/UI/CSS-мусор был отфильтрован.";
     }
 
     const mustBeFinal = mode === "final" || (mode === "auto" && requireDocsProcessed);
@@ -1347,10 +1470,12 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
           code: tender.code,
           deadline: tender.deadline,
           positionsCount: tender.positionsCount,
+          pageIsCaptcha: tender.pageIsCaptcha,
           documentsFound: tender.documents?.length || 0,
           documentsUploaded: uploadedDocuments.length,
           documentsParsed: parsedDocumentsCount,
           uploadErrors: uploadErrorCount,
+          summaryCreated: Boolean(summary),
         },
       });
     }
@@ -1359,11 +1484,6 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
 
     const finalTaskType = type || taskType || "Город";
     const title = tender.title || "Тендер Bidzaar";
-
-    const summary = buildSummary({
-      pageSummary: tender.pageSummary,
-      documentSummaries,
-    });
 
     const taskPayload = {
       title,
@@ -1425,6 +1545,7 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
         code: tender.code,
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
+        pageIsCaptcha: tender.pageIsCaptcha,
       },
       documents: {
         total: tender.documents?.length || 0,
@@ -1432,11 +1553,13 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
         parsed: parsedDocumentsCount,
         errors: uploadErrorCount,
       },
+      summaryCreated: Boolean(summary),
       parser: {
         jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
         pageTitle: tender.diagnostics?.pageTitle || null,
         extractedPageTitle: tender.diagnostics?.extractedPageTitle || null,
         company: tender.diagnostics?.company || null,
+        pageIsCaptcha: tender.diagnostics?.pageIsCaptcha || false,
       },
       usedColumnId: columnId,
       actualColumnId: fullTask?.columnId || null,
