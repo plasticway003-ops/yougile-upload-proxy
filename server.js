@@ -7,18 +7,16 @@ import { chromium } from "playwright";
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const APP_VERSION = "bidzaar-parser-v7";
+const APP_VERSION = "bidzaar-parser-v6";
 
 const PROXY_KEY = process.env.PROXY_KEY;
 const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
 const YOUGILE_BASE_URL = process.env.YOUGILE_BASE_URL || "https://ru.yougile.com";
-
-const YOUGILE_COLUMN_ID =
-  process.env.YOUGILE_COLUMN_ID || "7efb8402-7778-42a6-a86d-d0907b55086e";
+const YOUGILE_COLUMN_ID = process.env.YOUGILE_COLUMN_ID;
 
 const STICKERS = {
   taskType: "f0f3804f-b18f-4c40-8b26-f9d4da7b3d04",
@@ -79,28 +77,19 @@ function buildYouGileHeaders() {
   };
 }
 
+function normalizeDocumentName(name) {
+  return String(name || "document")
+    .replace(/^article\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function htmlEscape(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
-}
-
-function stripHtml(value) {
-  return String(value ?? "")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeDocumentName(name) {
-  return String(name || "document")
-    .replace(/^article\s+/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 function getFilenameFromUrl(url, fallback = "document") {
@@ -113,342 +102,6 @@ function getFilenameFromUrl(url, fallback = "document") {
   } catch {
     return normalizeDocumentName(fallback);
   }
-}
-
-function isObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
-}
-
-function flattenJson(value, result = [], depth = 0) {
-  if (depth > 10) return result;
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      flattenJson(item, result, depth + 1);
-    }
-
-    return result;
-  }
-
-  if (isObject(value)) {
-    result.push(value);
-
-    for (const item of Object.values(value)) {
-      flattenJson(item, result, depth + 1);
-    }
-  }
-
-  return result;
-}
-
-function pickFirstString(obj, keys) {
-  for (const key of keys) {
-    const value = obj?.[key];
-
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-
-    if (typeof value === "number") {
-      return String(value);
-    }
-  }
-
-  return null;
-}
-
-function pickFirstNumber(obj, keys) {
-  for (const key of keys) {
-    const value = obj?.[key];
-
-    if (typeof value === "number") {
-      return value;
-    }
-
-    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
-      return Number(value.trim());
-    }
-  }
-
-  return null;
-}
-
-function isBadPlaceholder(value) {
-  const raw = String(value || "").trim().toLowerCase();
-
-  if (!raw) return true;
-
-  return (
-    raw.includes("укажите") ||
-    raw.includes("введите") ||
-    raw.includes("заполните") ||
-    raw.includes("select") ||
-    raw.includes("choose") ||
-    raw.includes("placeholder") ||
-    raw === "bidzaar"
-  );
-}
-
-function isValidTenderCode(value) {
-  const raw = String(value || "").trim();
-
-  if (!raw) return false;
-  if (isBadPlaceholder(raw)) return false;
-
-  return /^\d{2,}[-/]\d{2,}$/.test(raw) || /^[A-ZА-Я0-9]{2,}[-/]\d{2,}$/i.test(raw);
-}
-
-function extractCodeFromUrl(sourceUrl) {
-  try {
-    const parsed = new URL(sourceUrl);
-
-    const candidates = [
-      parsed.searchParams.get("utm_content"),
-      parsed.searchParams.get("code"),
-      parsed.searchParams.get("number"),
-      parsed.searchParams.get("tenderCode"),
-      parsed.searchParams.get("procedureCode"),
-    ];
-
-    for (const candidate of candidates) {
-      if (isValidTenderCode(candidate)) {
-        return candidate.trim();
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function normalizeDocUrl(url, sourceUrl) {
-  if (!url) return null;
-
-  try {
-    return new URL(url, sourceUrl).toString();
-  } catch {
-    return null;
-  }
-}
-
-function isDocumentUrlOrName(value) {
-  const raw = String(value || "").toLowerCase();
-
-  return (
-    raw.includes(".doc") ||
-    raw.includes(".docx") ||
-    raw.includes(".xls") ||
-    raw.includes(".xlsx") ||
-    raw.includes(".pdf") ||
-    raw.includes(".zip") ||
-    raw.includes("download") ||
-    raw.includes("attachment") ||
-    raw.includes("file")
-  );
-}
-
-function looksLikeCaptchaOrAntibot(text) {
-  const raw = String(text || "").toLowerCase();
-
-  return (
-    raw.includes("are you not a robot") ||
-    raw.includes("are you a robot") ||
-    raw.includes("not a robot") ||
-    raw.includes("smart-captcha") ||
-    raw.includes("checkbox-captcha") ||
-    raw.includes("advanced-captcha") ||
-    raw.includes("captcha-backgrounds") ||
-    raw.includes("cloudlogo.svg") ||
-    raw.includes("captcha") ||
-    (raw.includes("yandex") && raw.includes("robot")) ||
-    (raw.includes("яндекс") && raw.includes("робот"))
-  );
-}
-
-function looksLikeCssOrUiTrash(text) {
-  const raw = String(text || "").toLowerCase();
-
-  return (
-    raw.includes("@media") ||
-    raw.includes("prefers-color-scheme") ||
-    raw.includes("background-image:url") ||
-    raw.includes("--smart-captcha") ||
-    raw.includes("rgba(") ||
-    raw.includes("border-radius") ||
-    raw.includes("font-family") ||
-    raw.includes("stylesheet") ||
-    raw.includes("javascript") ||
-    raw.includes("webpack") ||
-    raw.includes("__next_data__") ||
-    raw.includes("cdn.yandex.net") ||
-    raw.includes("svc.cdn.yandex.net")
-  );
-}
-
-function cleanSummaryText(text) {
-  const source = String(text || "");
-
-  if (!source.trim()) return "";
-
-  if (looksLikeCaptchaOrAntibot(source) || looksLikeCssOrUiTrash(source)) {
-    return "";
-  }
-
-  const raw = stripHtml(source)
-    .replace(/\b(Войти|Регистрация|Личный кабинет|Главная|Меню|Назад|Далее)\b/gi, " ")
-    .replace(/\b(Are you not a robot|Are you a robot|not a robot|captcha|SmartCaptcha)\b/gi, " ")
-    .replace(/@media[^{]*\{[^}]*\}/gi, " ")
-    .replace(/https?:\/\/\S+/gi, " ")
-    .replace(/\{[^{}]{50,}\}/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!raw) return "";
-
-  if (looksLikeCaptchaOrAntibot(raw) || looksLikeCssOrUiTrash(raw)) {
-    return "";
-  }
-
-  if (raw.length < 20) return "";
-
-  return raw.slice(0, 1200);
-}
-
-function extractTitleFromPageTitle(pageTitle) {
-  const raw = String(pageTitle || "").replace(/\s+/g, " ").trim();
-
-  if (!raw) return null;
-  if (looksLikeCaptchaOrAntibot(raw) || looksLikeCssOrUiTrash(raw)) return null;
-
-  const bidzaarMatch = raw.match(/^Тендер\s*\|\s*(.*?)\s*\|\s*Bidzaar$/i);
-
-  if (bidzaarMatch?.[1]) {
-    const title = bidzaarMatch[1].trim();
-
-    if (title && !isBadPlaceholder(title)) {
-      return title;
-    }
-  }
-
-  if (raw && raw.toLowerCase() !== "bidzaar" && !isBadPlaceholder(raw)) {
-    return raw;
-  }
-
-  return null;
-}
-
-function looksLikeCompany(value) {
-  const raw = String(value || "").trim();
-
-  if (!raw) return false;
-  if (raw.length < 2 || raw.length > 140) return false;
-  if (isBadPlaceholder(raw)) return false;
-  if (looksLikeCaptchaOrAntibot(raw) || looksLikeCssOrUiTrash(raw)) return false;
-
-  const lower = raw.toLowerCase();
-
-  if (
-    lower.includes("ооо") ||
-    lower.includes("ао ") ||
-    lower.includes("пао") ||
-    lower.includes("зао") ||
-    lower.includes("ип ") ||
-    lower.includes("кордиант") ||
-    lower.includes("megafon") ||
-    lower.includes("мегафон") ||
-    lower.includes("билайн") ||
-    lower.includes("positive technologies")
-  ) {
-    return true;
-  }
-
-  return /^[А-ЯA-Z0-9 «»"()._-]{3,}$/.test(raw);
-}
-
-function normalizeCompanyName(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .replace(/^Компания\s*[:\-]?\s*/i, "")
-    .replace(/^Заказчик\s*[:\-]?\s*/i, "")
-    .trim();
-}
-
-function extractCompanyFromJsonObjects(objects) {
-  const companyKeys = [
-    "company",
-    "companyName",
-    "customer",
-    "customerName",
-    "client",
-    "clientName",
-    "organizer",
-    "organizerName",
-    "organization",
-    "organizationName",
-    "buyer",
-    "buyerName",
-    "ownerName",
-  ];
-
-  const candidates = [];
-
-  for (const obj of objects) {
-    const candidate = pickFirstString(obj, companyKeys);
-
-    if (candidate && looksLikeCompany(candidate)) {
-      candidates.push(normalizeCompanyName(candidate));
-    }
-  }
-
-  const unique = [...new Set(candidates)];
-
-  const strong = unique.find((item) =>
-    /кордиант|ооо|пао|ао |зао|ип |мегафон|билайн|positive/i.test(item),
-  );
-
-  return strong || unique[0] || null;
-}
-
-function buildFinalTitle({ pageTitle, jsonTitle, company }) {
-  const titleFromPage = extractTitleFromPageTitle(pageTitle);
-
-  const cleanJsonTitle =
-    jsonTitle &&
-    !isBadPlaceholder(jsonTitle) &&
-    !looksLikeCaptchaOrAntibot(jsonTitle) &&
-    !looksLikeCssOrUiTrash(jsonTitle) &&
-    jsonTitle.length > 5
-      ? jsonTitle.trim()
-      : null;
-
-  const baseTitle = titleFromPage || cleanJsonTitle || "Тендер Bidzaar";
-
-  if (company && !baseTitle.toLowerCase().includes(company.toLowerCase())) {
-    return `${company} (${baseTitle})`;
-  }
-
-  if (baseTitle === "Тендер Bidzaar") {
-    return baseTitle;
-  }
-
-  if (/^тендер/i.test(baseTitle)) {
-    return baseTitle;
-  }
-
-  return `Тендер | ${baseTitle}`;
-}
-
-function looksLikeDeadline(value) {
-  if (!value) return false;
-
-  const raw = String(value);
-
-  return (
-    /\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}/.test(raw) ||
-    /\d{4}-\d{2}-\d{2}/.test(raw) ||
-    /T\d{2}:\d{2}/.test(raw)
-  );
 }
 
 function toTimestampMs(value) {
@@ -540,36 +193,14 @@ function makeShortTask(fullTask, fallback = {}) {
     idTaskProject: fullTask?.idTaskProject || null,
     idTaskCommon: fullTask?.idTaskCommon || null,
     title: fullTask?.title || fallback.title || null,
-    columnId: fullTask?.columnId || fallback.columnId || null,
+    columnId: fullTask?.columnId || null,
   };
 }
 
-function buildSummary({ pageSummary, documentSummaries }) {
-  const docText = documentSummaries
-    .map((doc) => doc.summary)
-    .filter(Boolean)
-    .join(" ");
-
-  const cleanDocText = cleanSummaryText(docText);
-
-  if (cleanDocText) {
-    return cleanDocText;
-  }
-
-  const cleanPageText = cleanSummaryText(pageSummary);
-
-  if (cleanPageText) {
-    return cleanPageText;
-  }
-
-  return "";
-}
-
-function makeDescription({ summary, documents = [], sourceUrl, preliminaryReason }) {
-  const finalSummary =
-    summary || "Выжимку не удалось сформировать автоматически. Проверьте вложения вручную.";
-
-  const safeSummary = htmlEscape(finalSummary);
+function makeDescription({ summary, documents = [], sourceUrl }) {
+  const safeSummary = summary
+    ? htmlEscape(summary)
+    : "Данные автоматически перенесены из Bidzaar.";
 
   const docsHtml = documents.length
     ? documents
@@ -582,90 +213,13 @@ function makeDescription({ summary, documents = [], sourceUrl, preliminaryReason
         .join("<br>")
     : "Документы не найдены.";
 
-  const warningHtml = preliminaryReason
-    ? `<p><strong>Важно:</strong> ${htmlEscape(preliminaryReason)}</p>`
-    : "";
-
   const safeSourceUrl = htmlEscape(sourceUrl);
 
   return [
-    warningHtml,
     `<p><strong>Выжимка:</strong> ${safeSummary}</p>`,
     `<p><strong>Документация:</strong><br>${docsHtml}</p>`,
     `<p><strong>Ссылка:</strong> <a target="_blank" rel="noopener noreferrer" href="${safeSourceUrl}">ссылка</a></p>`,
   ].join("");
-}
-
-async function optionalImport(packageName) {
-  try {
-    return await import(packageName);
-  } catch {
-    return null;
-  }
-}
-
-async function extractTextFromBuffer({ buffer, filename, contentType }) {
-  const name = String(filename || "").toLowerCase();
-  const type = String(contentType || "").toLowerCase();
-
-  try {
-    if (name.endsWith(".docx") || type.includes("wordprocessingml")) {
-      const mammothModule = await optionalImport("mammoth");
-      const mammoth = mammothModule?.default || mammothModule;
-
-      if (!mammoth?.extractRawText) return "";
-
-      const result = await mammoth.extractRawText({ buffer });
-
-      return cleanSummaryText(result.value || "");
-    }
-
-    if (name.endsWith(".xlsx") || name.endsWith(".xls") || type.includes("spreadsheet")) {
-      const xlsxModule = await optionalImport("xlsx");
-      const XLSX = xlsxModule?.default || xlsxModule;
-
-      if (!XLSX?.read || !XLSX?.utils) return "";
-
-      const workbook = XLSX.read(buffer, { type: "buffer" });
-
-      const chunks = [];
-
-      for (const sheetName of workbook.SheetNames.slice(0, 5)) {
-        const sheet = workbook.Sheets[sheetName];
-        const csv = XLSX.utils.sheet_to_csv(sheet);
-
-        if (csv) {
-          chunks.push(`${sheetName}: ${csv}`);
-        }
-      }
-
-      return cleanSummaryText(chunks.join(" "));
-    }
-
-    if (name.endsWith(".pdf") || type.includes("pdf")) {
-      const pdfModule = await optionalImport("pdf-parse");
-      const pdfParse = pdfModule?.default || pdfModule;
-
-      if (!pdfParse) return "";
-
-      const result = await pdfParse(buffer);
-
-      return cleanSummaryText(result.text || "");
-    }
-
-    if (
-      type.startsWith("text/") ||
-      name.endsWith(".txt") ||
-      name.endsWith(".csv") ||
-      name.endsWith(".json")
-    ) {
-      return cleanSummaryText(buffer.toString("utf8"));
-    }
-  } catch {
-    return "";
-  }
-
-  return "";
 }
 
 async function downloadFileByUrl(url, filename) {
@@ -674,10 +228,7 @@ async function downloadFileByUrl(url, filename) {
     timeout: 120000,
     maxRedirects: 10,
     headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-      Accept:
-        "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/msword,application/vnd.ms-excel,application/zip,*/*",
+      "User-Agent": "Mozilla/5.0",
     },
   });
 
@@ -700,13 +251,17 @@ async function uploadFileToYouGile({ buffer, filename, contentType }) {
     contentType: contentType || "application/octet-stream",
   });
 
-  const response = await axios.post(`${YOUGILE_BASE_URL}/api-v2/upload-file`, form, {
-    timeout: 120000,
-    headers: {
-      Authorization: `Bearer ${YOUGILE_TOKEN}`,
-      ...form.getHeaders(),
+  const response = await axios.post(
+    `${YOUGILE_BASE_URL}/api-v2/upload-file`,
+    form,
+    {
+      timeout: 120000,
+      headers: {
+        Authorization: `Bearer ${YOUGILE_TOKEN}`,
+        ...form.getHeaders(),
+      },
     },
-  });
+  );
 
   const data = response.data || {};
 
@@ -730,25 +285,24 @@ async function uploadFileToYouGile({ buffer, filename, contentType }) {
 
 async function uploadTenderFileByUrl(url, filename) {
   const downloaded = await downloadFileByUrl(url, filename);
-
-  const summary = await extractTextFromBuffer(downloaded);
-
   const uploaded = await uploadFileToYouGile(downloaded);
 
   return {
     name: normalizeDocumentName(downloaded.filename),
     originalUrl: url,
     yougileUrl: uploaded.url,
-    summary,
-    parsed: Boolean(summary),
   };
 }
 
 async function createYouGileTask(taskPayload) {
-  const response = await axios.post(`${YOUGILE_BASE_URL}/api-v2/tasks`, taskPayload, {
-    timeout: 120000,
-    headers: buildYouGileHeaders(),
-  });
+  const response = await axios.post(
+    `${YOUGILE_BASE_URL}/api-v2/tasks`,
+    taskPayload,
+    {
+      timeout: 120000,
+      headers: buildYouGileHeaders(),
+    },
+  );
 
   return response.data;
 }
@@ -758,10 +312,13 @@ async function getYouGileTaskByIdApi(taskId) {
     throw new Error("taskId is required");
   }
 
-  const response = await axios.get(`${YOUGILE_BASE_URL}/api-v2/tasks/${taskId}`, {
-    timeout: 120000,
-    headers: buildYouGileHeaders(),
-  });
+  const response = await axios.get(
+    `${YOUGILE_BASE_URL}/api-v2/tasks/${taskId}`,
+    {
+      timeout: 120000,
+      headers: buildYouGileHeaders(),
+    },
+  );
 
   return response.data;
 }
@@ -775,6 +332,251 @@ function getCreatedTaskId(createdResponse) {
     createdResponse?.data?.task?.id ||
     null
   );
+}
+
+function isObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function flattenJson(value, result = [], depth = 0) {
+  if (depth > 8) return result;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      flattenJson(item, result, depth + 1);
+    }
+
+    return result;
+  }
+
+  if (isObject(value)) {
+    result.push(value);
+
+    for (const item of Object.values(value)) {
+      flattenJson(item, result, depth + 1);
+    }
+  }
+
+  return result;
+}
+
+function pickFirstString(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+
+    if (typeof value === "number") {
+      return String(value);
+    }
+  }
+
+  return null;
+}
+
+function pickFirstNumber(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+
+    if (typeof value === "number") {
+      return value;
+    }
+
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+      return Number(value.trim());
+    }
+  }
+
+  return null;
+}
+
+function looksLikeDeadline(value) {
+  if (!value) return false;
+
+  const raw = String(value);
+
+  return (
+    /\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}/.test(raw) ||
+    /\d{4}-\d{2}-\d{2}/.test(raw) ||
+    /T\d{2}:\d{2}/.test(raw)
+  );
+}
+
+function normalizeDocUrl(url, sourceUrl) {
+  if (!url) return null;
+
+  try {
+    return new URL(url, sourceUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+function isBadPlaceholder(value) {
+  const raw = String(value || "").trim().toLowerCase();
+
+  if (!raw) return true;
+
+  return (
+    raw.includes("укажите") ||
+    raw.includes("введите") ||
+    raw.includes("заполните") ||
+    raw.includes("select") ||
+    raw.includes("choose") ||
+    raw.includes("placeholder")
+  );
+}
+
+function isValidTenderCode(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw) return false;
+  if (isBadPlaceholder(raw)) return false;
+
+  return /^\d{2,}[-/]\d{2,}$/.test(raw) || /^[A-ZА-Я0-9]{2,}[-/]\d{2,}$/i.test(raw);
+}
+
+function extractCodeFromUrl(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+
+    const candidates = [
+      parsed.searchParams.get("utm_content"),
+      parsed.searchParams.get("code"),
+      parsed.searchParams.get("number"),
+      parsed.searchParams.get("tenderCode"),
+      parsed.searchParams.get("procedureCode"),
+    ];
+
+    for (const candidate of candidates) {
+      if (isValidTenderCode(candidate)) {
+        return candidate.trim();
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTitleFromPageTitle(pageTitle) {
+  const raw = String(pageTitle || "").replace(/\s+/g, " ").trim();
+
+  if (!raw) return null;
+
+  const bidzaarMatch = raw.match(/^Тендер\s*\|\s*(.*?)\s*\|\s*Bidzaar$/i);
+
+  if (bidzaarMatch?.[1]) {
+    const title = bidzaarMatch[1].trim();
+
+    if (title && !isBadPlaceholder(title)) {
+      return title;
+    }
+  }
+
+  if (raw && raw.toLowerCase() !== "bidzaar" && !isBadPlaceholder(raw)) {
+    return raw;
+  }
+
+  return null;
+}
+
+function looksLikeCompany(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw) return false;
+  if (raw.length < 2 || raw.length > 120) return false;
+  if (isBadPlaceholder(raw)) return false;
+
+  const lower = raw.toLowerCase();
+
+  if (
+    lower.includes("ооо") ||
+    lower.includes("ао ") ||
+    lower.includes("пао") ||
+    lower.includes("зао") ||
+    lower.includes("ип ") ||
+    lower.includes("кордиант") ||
+    lower.includes("megafon") ||
+    lower.includes("мегафон") ||
+    lower.includes("билайн")
+  ) {
+    return true;
+  }
+
+  return /^[А-ЯA-Z0-9 «»"()._-]{3,}$/.test(raw);
+}
+
+function normalizeCompanyName(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/^Компания\s*[:\-]?\s*/i, "")
+    .replace(/^Заказчик\s*[:\-]?\s*/i, "")
+    .trim();
+}
+
+function extractCompanyFromJsonObjects(objects) {
+  const companyKeys = [
+    "company",
+    "companyName",
+    "customer",
+    "customerName",
+    "client",
+    "clientName",
+    "organizer",
+    "organizerName",
+    "organization",
+    "organizationName",
+    "buyer",
+    "buyerName",
+    "ownerName",
+  ];
+
+  const candidates = [];
+
+  for (const obj of objects) {
+    const candidate = pickFirstString(obj, companyKeys);
+
+    if (candidate && looksLikeCompany(candidate)) {
+      candidates.push(normalizeCompanyName(candidate));
+    }
+  }
+
+  const unique = [...new Set(candidates)];
+
+  const strong = unique.find((item) =>
+    /кордиант|ооо|пао|ао |зао|ип |мегафон|билайн/i.test(item),
+  );
+
+  return strong || unique[0] || null;
+}
+
+function buildFinalTitle({ pageTitle, jsonTitle, company }) {
+  const titleFromPage = extractTitleFromPageTitle(pageTitle);
+
+  const cleanJsonTitle =
+    jsonTitle && !isBadPlaceholder(jsonTitle) && jsonTitle.toLowerCase() !== "bidzaar"
+      ? jsonTitle.trim()
+      : null;
+
+  const baseTitle = titleFromPage || cleanJsonTitle || "Тендер Bidzaar";
+
+  if (company && !baseTitle.toLowerCase().includes(company.toLowerCase())) {
+    return `${company} (${baseTitle})`;
+  }
+
+  if (baseTitle === "Тендер Bidzaar") {
+    return baseTitle;
+  }
+
+  if (/^тендер/i.test(baseTitle)) {
+    return baseTitle;
+  }
+
+  return `Тендер | ${baseTitle}`;
 }
 
 function extractDocumentsFromJsonObjects(objects, sourceUrl) {
@@ -810,9 +612,23 @@ function extractDocumentsFromJsonObjects(objects, sourceUrl) {
     const maybeName = pickFirstString(obj, nameKeys);
     const maybeUrl = pickFirstString(obj, urlKeys);
 
+    const lowerName = String(maybeName || "").toLowerCase();
+    const lowerUrl = String(maybeUrl || "").toLowerCase();
+
     const looksLikeFile =
-      isDocumentUrlOrName(maybeName) ||
-      isDocumentUrlOrName(maybeUrl) ||
+      lowerName.includes(".doc") ||
+      lowerName.includes(".docx") ||
+      lowerName.includes(".xls") ||
+      lowerName.includes(".xlsx") ||
+      lowerName.includes(".pdf") ||
+      lowerName.includes(".zip") ||
+      lowerUrl.includes(".doc") ||
+      lowerUrl.includes(".docx") ||
+      lowerUrl.includes(".xls") ||
+      lowerUrl.includes(".xlsx") ||
+      lowerUrl.includes(".pdf") ||
+      lowerUrl.includes(".zip") ||
+      lowerUrl.includes("download") ||
       maybeType.includes("pdf") ||
       maybeType.includes("word") ||
       maybeType.includes("excel") ||
@@ -843,7 +659,6 @@ function extractDocumentsFromJsonObjects(objects, sourceUrl) {
 
   return docs;
 }
-
 function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
   const allObjects = [];
 
@@ -908,8 +723,6 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
         maybeTitle.length > 5 &&
         maybeTitle.length < 300 &&
         !isBadPlaceholder(maybeTitle) &&
-        !looksLikeCaptchaOrAntibot(maybeTitle) &&
-        !looksLikeCssOrUiTrash(maybeTitle) &&
         !["bidzaar", "menu", "home", "бейджи"].includes(maybeTitle.toLowerCase())
       ) {
         jsonTitle = maybeTitle;
@@ -963,14 +776,6 @@ function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
 function extractTenderFromText(text, sourceUrl) {
   const safeText = String(text || "");
 
-  if (looksLikeCaptchaOrAntibot(safeText) || looksLikeCssOrUiTrash(safeText)) {
-    return {
-      code: extractCodeFromUrl(sourceUrl),
-      deadline: null,
-      positionsCount: null,
-    };
-  }
-
   const codeMatch =
     safeText.match(/\b(\d{2,}[-/]\d{2,})\b/) ||
     safeText.match(/код[:\s№-]*(\d{2,}[-/]\d{2,})/i) ||
@@ -1015,10 +820,6 @@ async function parseBidzaarTenderPage(url) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     });
 
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    });
-
     page.on("response", async (response) => {
       try {
         const responseUrl = response.url();
@@ -1040,7 +841,7 @@ async function parseBidzaarTenderPage(url) {
 
         responseUrls.push(responseUrl);
 
-        if (jsonResponses.length < 100) {
+        if (jsonResponses.length < 80) {
           jsonResponses.push({
             url: responseUrl,
             json,
@@ -1056,25 +857,20 @@ async function parseBidzaarTenderPage(url) {
       timeout: 90000,
     });
 
-    await page
-      .waitForLoadState("networkidle", {
-        timeout: 45000,
-      })
-      .catch(() => null);
+    await page.waitForLoadState("networkidle", {
+      timeout: 45000,
+    }).catch(() => null);
 
     await page.waitForTimeout(7000);
 
-    await page
-      .evaluate(() => {
-        window.scrollTo(0, document.body.scrollHeight);
-      })
-      .catch(() => null);
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => null);
 
     await page.waitForTimeout(3000);
 
     const domData = await page.evaluate(() => {
       const text = document.body?.innerText || "";
-      const html = document.documentElement?.innerHTML || "";
 
       const pageTitle =
         document.querySelector("h1")?.innerText?.trim() ||
@@ -1108,7 +904,6 @@ async function parseBidzaarTenderPage(url) {
             lowerUrl.includes(".pdf") ||
             lowerUrl.includes(".zip") ||
             lowerUrl.includes("download") ||
-            lowerUrl.includes("attachment") ||
             lowerName.includes(".doc") ||
             lowerName.includes(".docx") ||
             lowerName.includes(".xls") ||
@@ -1121,24 +916,15 @@ async function parseBidzaarTenderPage(url) {
       return {
         pageTitle,
         text,
-        html,
         documents,
       };
     });
 
-    const pageIsCaptcha =
-      looksLikeCaptchaOrAntibot(domData.text) ||
-      looksLikeCaptchaOrAntibot(domData.html) ||
-      looksLikeCssOrUiTrash(domData.text) ||
-      looksLikeCssOrUiTrash(domData.html);
-
-    const safePageText = pageIsCaptcha ? "" : domData.text;
-
-    const textTender = extractTenderFromText(safePageText, url);
+    const textTender = extractTenderFromText(domData.text, url);
     const jsonTender = extractTenderFromJsonResponses(jsonResponses, url);
 
     const title = buildFinalTitle({
-      pageTitle: pageIsCaptcha ? "" : domData.pageTitle,
+      pageTitle: domData.pageTitle,
       jsonTitle: jsonTender.jsonTitle,
       company: jsonTender.company,
     });
@@ -1146,60 +932,51 @@ async function parseBidzaarTenderPage(url) {
     const code = jsonTender.code || textTender.code || null;
     const deadline = jsonTender.deadline || textTender.deadline || null;
 
-    const domDocuments = pageIsCaptcha
-      ? []
-      : domData.documents.map((doc, index) => ({
-          name: normalizeDocumentName(
-            doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
-          ),
-          url: doc.url,
-        }));
+    const domDocuments = domData.documents.map((doc, index) => ({
+      name: normalizeDocumentName(
+        doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
+      ),
+      url: doc.url,
+    }));
 
     const documents = [];
     const seenDocs = new Set();
 
     for (const doc of [...jsonTender.documents, ...domDocuments]) {
-      const finalUrl = normalizeDocUrl(doc.url, url);
-
-      if (!finalUrl) continue;
-
-      const finalName = normalizeDocumentName(
-        doc.name || getFilenameFromUrl(finalUrl, "Документ"),
-      );
-
-      const key = `${finalName}|${finalUrl}`;
+      const key = `${doc.name}|${doc.url}`;
 
       if (seenDocs.has(key)) continue;
 
       seenDocs.add(key);
-      documents.push({
-        name: finalName,
-        url: finalUrl,
-      });
+      documents.push(doc);
     }
 
     const positionsCount =
-      jsonTender.positionsCount || textTender.positionsCount || documents.length || 0;
+      jsonTender.positionsCount ||
+      textTender.positionsCount ||
+      documents.length ||
+      0;
 
-    const pageSummary = pageIsCaptcha ? "" : cleanSummaryText(domData.text);
+    const summary = domData.text
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 900);
 
     return {
       title,
       code,
       deadline,
       positionsCount,
-      pageSummary,
-      pageIsCaptcha,
+      summary,
       documents,
       sourceUrl: url,
       diagnostics: {
         pageTitle: domData.pageTitle,
-        extractedPageTitle: pageIsCaptcha ? null : extractTitleFromPageTitle(domData.pageTitle),
+        extractedPageTitle: extractTitleFromPageTitle(domData.pageTitle),
         jsonTitle: jsonTender.jsonTitle,
         company: jsonTender.company,
         jsonResponsesCount: jsonResponses.length,
         responseUrlsCount: responseUrls.length,
-        pageIsCaptcha,
       },
     };
   } finally {
@@ -1218,19 +995,9 @@ function makeCompactParseResponse(tender) {
     deadline: tender.deadline || null,
     positionsCount: tender.positionsCount || 0,
     documentsCount: tender.documents?.length || 0,
-    pageIsCaptcha: Boolean(tender.pageIsCaptcha),
     pageTitle: tender.diagnostics?.pageTitle || null,
     jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
   };
-}
-
-function normalizeCreateMode(value) {
-  const raw = String(value || "auto").trim().toLowerCase();
-
-  if (raw === "final") return "final";
-  if (raw === "preliminary") return "preliminary";
-
-  return "auto";
 }
 
 app.get("/", (req, res) => {
@@ -1238,7 +1005,6 @@ app.get("/", (req, res) => {
     ok: true,
     version: APP_VERSION,
     service: "yougile-upload-proxy",
-    defaultColumnId: YOUGILE_COLUMN_ID,
     endpoints: [
       "POST /parse-bidzaar",
       "POST /parse-bidzaar-compact",
@@ -1271,7 +1037,6 @@ app.post("/parse-bidzaar-compact", requireProxyKey, async (req, res) => {
     });
   }
 });
-
 app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
   try {
     const { url } = req.body || {};
@@ -1295,8 +1060,6 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
         documentsCount: tender.documents.length,
-        pageSummary: tender.pageSummary,
-        pageIsCaptcha: tender.pageIsCaptcha,
       },
       diagnostics: {
         pageTitle: tender.diagnostics?.pageTitle || null,
@@ -1304,7 +1067,6 @@ app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
         jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
         company: tender.diagnostics?.company || null,
         jsonTitle: tender.diagnostics?.jsonTitle || null,
-        pageIsCaptcha: tender.diagnostics?.pageIsCaptcha || false,
       },
     });
   } catch (error) {
@@ -1332,17 +1094,11 @@ app.post("/upload-by-url", requireProxyKey, async (req, res) => {
 
     let uploadedCount = 0;
     let errorCount = 0;
-    let parsedCount = 0;
 
     for (const itemUrl of items) {
       try {
-        const uploaded = await uploadTenderFileByUrl(itemUrl);
-
+        await uploadTenderFileByUrl(itemUrl);
         uploadedCount += 1;
-
-        if (uploaded.parsed) {
-          parsedCount += 1;
-        }
       } catch {
         errorCount += 1;
       }
@@ -1352,7 +1108,6 @@ app.post("/upload-by-url", requireProxyKey, async (req, res) => {
       ok: errorCount === 0,
       version: APP_VERSION,
       uploaded: uploadedCount,
-      parsed: parsedCount,
       errors: errorCount,
     });
   } catch (error) {
@@ -1373,8 +1128,6 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
       type,
       assigned = [],
       color,
-      requireDocsProcessed = true,
-      createMode = "auto",
     } = req.body || {};
 
     if (!url) {
@@ -1385,23 +1138,21 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
       });
     }
 
-    const mode = normalizeCreateMode(createMode);
     const columnId = bodyColumnId || YOUGILE_COLUMN_ID;
 
     if (!columnId) {
       return res.status(400).json({
         ok: false,
         version: APP_VERSION,
-        error: "columnId is required. Pass columnId in body or set YOUGILE_COLUMN_ID env.",
+        error:
+          "columnId is required. Pass columnId in body or set YOUGILE_COLUMN_ID env.",
       });
     }
 
     const tender = await parseBidzaarTenderPage(url);
 
     const uploadedDocuments = [];
-    const documentSummaries = [];
     let uploadErrorCount = 0;
-    let parsedDocumentsCount = 0;
 
     for (const doc of tender.documents || []) {
       try {
@@ -1411,76 +1162,10 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
         );
 
         uploadedDocuments.push(uploaded);
-
-        if (uploaded.parsed && uploaded.summary) {
-          parsedDocumentsCount += 1;
-          documentSummaries.push({
-            name: uploaded.name,
-            summary: uploaded.summary,
-          });
-        }
       } catch {
         uploadErrorCount += 1;
       }
     }
-
-    const summary = buildSummary({
-      pageSummary: tender.pageSummary,
-      documentSummaries,
-    });
-
-    const docsProcessed =
-      uploadedDocuments.length > 0 &&
-      uploadErrorCount === 0 &&
-      parsedDocumentsCount > 0 &&
-      Boolean(summary);
-
-    const noDocsFound = !tender.documents?.length;
-    const noDocsParsed = uploadedDocuments.length > 0 && parsedDocumentsCount === 0;
-    const hasUploadErrors = uploadErrorCount > 0;
-
-    let preliminaryReason = "";
-
-    if (tender.pageIsCaptcha) {
-      preliminaryReason =
-        "Bidzaar отдал антибот-страницу/Captcha. Текст страницы не использован в выжимке.";
-    } else if (noDocsFound) {
-      preliminaryReason = "Документы в Bidzaar не найдены или недоступны для скачивания.";
-    } else if (hasUploadErrors) {
-      preliminaryReason = "Не все документы удалось скачать или загрузить в YouGile.";
-    } else if (noDocsParsed) {
-      preliminaryReason =
-        "Документы загружены, но текст из них не удалось извлечь. Проверьте вложения вручную.";
-    } else if (!summary) {
-      preliminaryReason =
-        "Не удалось получить чистую выжимку. Captcha/UI/CSS-мусор был отфильтрован.";
-    }
-
-    const mustBeFinal = mode === "final" || (mode === "auto" && requireDocsProcessed);
-
-    if (mustBeFinal && !docsProcessed) {
-      return res.status(422).json({
-        ok: false,
-        version: APP_VERSION,
-        error: "docsProcessed=false. Final task was not created.",
-        docsProcessed,
-        preliminaryReason,
-        tender: {
-          title: tender.title,
-          code: tender.code,
-          deadline: tender.deadline,
-          positionsCount: tender.positionsCount,
-          pageIsCaptcha: tender.pageIsCaptcha,
-          documentsFound: tender.documents?.length || 0,
-          documentsUploaded: uploadedDocuments.length,
-          documentsParsed: parsedDocumentsCount,
-          uploadErrors: uploadErrorCount,
-          summaryCreated: Boolean(summary),
-        },
-      });
-    }
-
-    const shouldCreatePreliminary = mode === "preliminary" || !docsProcessed;
 
     const finalTaskType = type || taskType || "Город";
     const title = tender.title || "Тендер Bidzaar";
@@ -1489,10 +1174,9 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
       title,
       columnId,
       description: makeDescription({
-        summary,
+        summary: tender.summary,
         documents: uploadedDocuments,
         sourceUrl: url,
-        preliminaryReason: shouldCreatePreliminary ? preliminaryReason : "",
       }),
       stickers: makeStickers({
         taskType: finalTaskType,
@@ -1526,40 +1210,31 @@ app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
     }
 
     const fullTask = await getYouGileTaskByIdApi(createdTaskId);
-
     const shortTask = makeShortTask(fullTask, {
       id: createdTaskId,
       title,
-      columnId,
     });
 
     return res.json({
       ok: true,
       version: APP_VERSION,
-      docsProcessed,
-      preliminary: shouldCreatePreliminary,
-      preliminaryReason: shouldCreatePreliminary ? preliminaryReason : null,
       task: shortTask,
       tender: {
         title: tender.title,
         code: tender.code,
         deadline: tender.deadline,
         positionsCount: tender.positionsCount,
-        pageIsCaptcha: tender.pageIsCaptcha,
       },
       documents: {
         total: tender.documents?.length || 0,
         uploaded: uploadedDocuments.length,
-        parsed: parsedDocumentsCount,
         errors: uploadErrorCount,
       },
-      summaryCreated: Boolean(summary),
       parser: {
         jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
         pageTitle: tender.diagnostics?.pageTitle || null,
         extractedPageTitle: tender.diagnostics?.extractedPageTitle || null,
         company: tender.diagnostics?.company || null,
-        pageIsCaptcha: tender.diagnostics?.pageIsCaptcha || false,
       },
       usedColumnId: columnId,
       actualColumnId: fullTask?.columnId || null,
