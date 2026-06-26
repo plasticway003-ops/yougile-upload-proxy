@@ -11,7 +11,7 @@ app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const APP_VERSION = "bidzaar-parser-v6";
+const APP_VERSION = "bidzaar-parser-v7-preview";
 
 const PROXY_KEY = process.env.PROXY_KEY;
 const YOUGILE_TOKEN = process.env.YOUGILE_TOKEN;
@@ -39,6 +39,8 @@ const STICKER_VALUES = {
     Bidzaar: "be00170e0502",
   },
 };
+
+const previewStore = new Map();
 
 function requireProxyKey(req, res, next) {
   if (!PROXY_KEY) {
@@ -90,6 +92,41 @@ function htmlEscape(value) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function stripHtml(value) {
+  return String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanBusinessText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/utm_[a-z_]+=[^&\s]+/gi, "")
+    .replace(/token=[^&\s]+/gi, "")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "")
+    .replace(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/gi, "")
+    .replace(/\b(id|uuid|metadata|history|stickers|columnId|taskId)\b/gi, "")
+    .trim();
+}
+
+function getTenderSourceUrl(url) {
+  try {
+    const parsed = new URL(url);
+
+    parsed.searchParams.delete("utm_campaign");
+    parsed.searchParams.delete("utm_term");
+    parsed.searchParams.delete("utm_source");
+    parsed.searchParams.delete("utm_medium");
+    parsed.searchParams.delete("utm_content");
+    parsed.searchParams.delete("token");
+
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 function getFilenameFromUrl(url, fallback = "document") {
@@ -195,31 +232,6 @@ function makeShortTask(fullTask, fallback = {}) {
     title: fullTask?.title || fallback.title || null,
     columnId: fullTask?.columnId || null,
   };
-}
-
-function makeDescription({ summary, documents = [], sourceUrl }) {
-  const safeSummary = summary
-    ? htmlEscape(summary)
-    : "Данные автоматически перенесены из Bidzaar.";
-
-  const docsHtml = documents.length
-    ? documents
-        .map((doc) => {
-          const name = htmlEscape(normalizeDocumentName(doc.name || doc.filename));
-          const url = htmlEscape(doc.yougileUrl || doc.url);
-
-          return `<a target="_blank" rel="noopener noreferrer" href="${url}">${name}</a>`;
-        })
-        .join("<br>")
-    : "Документы не найдены.";
-
-  const safeSourceUrl = htmlEscape(sourceUrl);
-
-  return [
-    `<p><strong>Выжимка:</strong> ${safeSummary}</p>`,
-    `<p><strong>Документация:</strong><br>${docsHtml}</p>`,
-    `<p><strong>Ссылка:</strong> <a target="_blank" rel="noopener noreferrer" href="${safeSourceUrl}">ссылка</a></p>`,
-  ].join("");
 }
 
 async function downloadFileByUrl(url, filename) {
@@ -488,7 +500,7 @@ function looksLikeCompany(value) {
   const raw = String(value || "").trim();
 
   if (!raw) return false;
-  if (raw.length < 2 || raw.length > 120) return false;
+  if (raw.length < 2 || raw.length > 160) return false;
   if (isBadPlaceholder(raw)) return false;
 
   const lower = raw.toLowerCase();
@@ -502,7 +514,9 @@ function looksLikeCompany(value) {
     lower.includes("кордиант") ||
     lower.includes("megafon") ||
     lower.includes("мегафон") ||
-    lower.includes("билайн")
+    lower.includes("билайн") ||
+    lower.includes("positive technologies") ||
+    lower.includes("авито")
   ) {
     return true;
   }
@@ -548,7 +562,7 @@ function extractCompanyFromJsonObjects(objects) {
   const unique = [...new Set(candidates)];
 
   const strong = unique.find((item) =>
-    /кордиант|ооо|пао|ао |зао|ип |мегафон|билайн/i.test(item),
+    /кордиант|ооо|пао|ао |зао|ип |мегафон|билайн|positive technologies|авито/i.test(item),
   );
 
   return strong || unique[0] || null;
@@ -659,3 +673,979 @@ function extractDocumentsFromJsonObjects(objects, sourceUrl) {
 
   return docs;
 }
+
+function extractTenderFromJsonResponses(jsonResponses, sourceUrl) {
+  const allObjects = [];
+
+  for (const response of jsonResponses) {
+    flattenJson(response.json, allObjects);
+  }
+
+  let jsonTitle = null;
+  let code = extractCodeFromUrl(sourceUrl);
+  let deadline = null;
+  let positionsCount = null;
+
+  const titleKeys = [
+    "procedureName",
+    "processName",
+    "tenderName",
+    "lotName",
+    "subject",
+    "title",
+    "name",
+  ];
+
+  const strictCodeKeys = [
+    "procedureCode",
+    "tenderCode",
+    "processCode",
+    "codeNumber",
+    "procedureNumber",
+    "processNumber",
+    "tenderNumber",
+    "publicNumber",
+    "publicId",
+  ];
+
+  const deadlineKeys = [
+    "deadline",
+    "endDate",
+    "finishDate",
+    "endAt",
+    "finishedAt",
+    "submissionDeadline",
+    "applicationDeadline",
+    "dateEnd",
+    "bidEndDate",
+    "requestEndDate",
+  ];
+
+  const positionKeys = [
+    "positionsCount",
+    "itemsCount",
+    "lotsCount",
+    "quantity",
+    "count",
+  ];
+
+  for (const obj of allObjects) {
+    if (!jsonTitle) {
+      const maybeTitle = pickFirstString(obj, titleKeys);
+
+      if (
+        maybeTitle &&
+        maybeTitle.length > 5 &&
+        maybeTitle.length < 300 &&
+        !isBadPlaceholder(maybeTitle) &&
+        !["bidzaar", "menu", "home", "бейджи"].includes(maybeTitle.toLowerCase())
+      ) {
+        jsonTitle = maybeTitle;
+      }
+    }
+
+    if (!code) {
+      for (const key of strictCodeKeys) {
+        const maybeCode = obj?.[key];
+
+        if (isValidTenderCode(maybeCode)) {
+          code = String(maybeCode).trim();
+          break;
+        }
+      }
+    }
+
+    if (!deadline) {
+      for (const key of deadlineKeys) {
+        const value = obj?.[key];
+
+        if (value && looksLikeDeadline(value)) {
+          deadline = String(value);
+          break;
+        }
+      }
+    }
+
+    if (!positionsCount) {
+      const maybeCount = pickFirstNumber(obj, positionKeys);
+
+      if (maybeCount && maybeCount > 0 && maybeCount < 100000) {
+        positionsCount = maybeCount;
+      }
+    }
+  }
+
+  const company = extractCompanyFromJsonObjects(allObjects);
+  const documents = extractDocumentsFromJsonObjects(allObjects, sourceUrl);
+
+  return {
+    jsonTitle,
+    company,
+    code,
+    deadline,
+    positionsCount,
+    documents,
+  };
+}
+
+function extractTenderFromText(text, sourceUrl) {
+  const safeText = String(text || "");
+
+  const codeMatch =
+    safeText.match(/\b(\d{2,}[-/]\d{2,})\b/) ||
+    safeText.match(/код[:\s№-]*(\d{2,}[-/]\d{2,})/i) ||
+    safeText.match(/№[:\s]*(\d{2,}[-/]\d{2,})/i);
+
+  const urlCode = extractCodeFromUrl(sourceUrl);
+
+  const deadlineMatch =
+    safeText.match(
+      /(дата\s+окончания|дедлайн|окончание|срок\s+подачи)[^\d]{0,80}(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}(?:\s+\d{1,2}:\d{2})?)/i,
+    ) || safeText.match(/(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4}\s+\d{1,2}:\d{2})/);
+
+  const positionsMatch =
+    safeText.match(/позици[ийя]{1,2}[^\d]{0,20}(\d+)/i) ||
+    safeText.match(/лотов[^\d]{0,20}(\d+)/i);
+
+  return {
+    code: urlCode || codeMatch?.[1] || null,
+    deadline: deadlineMatch?.[2] || deadlineMatch?.[1] || null,
+    positionsCount: positionsMatch ? Number(positionsMatch[1]) : null,
+  };
+}
+
+function guessCustomerFromTitle(title) {
+  const raw = String(title || "").trim();
+
+  if (!raw) return null;
+
+  const bracketMatch = raw.match(/^(.+?)\s*\(/);
+
+  if (bracketMatch?.[1]) {
+    return bracketMatch[1].replace(/^Тендер\s*\|\s*/i, "").trim();
+  }
+
+  const pipeParts = raw.split("|").map((item) => item.trim()).filter(Boolean);
+
+  if (pipeParts.length > 1) {
+    return pipeParts[1];
+  }
+
+  return null;
+}
+
+function guessSubjectFromTitle(title) {
+  const raw = String(title || "").trim();
+
+  if (!raw) return null;
+
+  const bracketMatch = raw.match(/\((.+)\)/);
+
+  if (bracketMatch?.[1]) {
+    return bracketMatch[1].trim();
+  }
+
+  return raw.replace(/^Тендер\s*\|\s*/i, "").trim();
+}
+
+function pickSentences(text, keywords, limit = 3) {
+  const clean = cleanBusinessText(stripHtml(text));
+
+  const sentences = clean
+    .split(/(?<=[.!?])\s+|;\s+|\n+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 20 && item.length < 500);
+
+  const found = [];
+
+  for (const sentence of sentences) {
+    const lower = sentence.toLowerCase();
+
+    if (keywords.some((keyword) => lower.includes(keyword))) {
+      found.push(sentence);
+    }
+
+    if (found.length >= limit) break;
+  }
+
+  return found;
+}
+
+function formatPreviewSection(title, value) {
+  const safeValue = value && String(value).trim() ? htmlEscape(value) : "не указано";
+
+  return `<p><strong>${title}:</strong><br>${safeValue}</p>`;
+}
+
+function formatPreviewDocuments(documents = []) {
+  if (!documents.length) {
+    return "не указано";
+  }
+
+  return `<ul>${documents
+    .map((doc) => {
+      const name = htmlEscape(normalizeDocumentName(doc.name || doc.filename || "Документ"));
+      return `<li>${name}</li>`;
+    })
+    .join("")}</ul>`;
+}
+
+function buildTenderPreview(tender) {
+  const summary = cleanBusinessText(tender.summary || "");
+  const customer = tender.diagnostics?.company || guessCustomerFromTitle(tender.title) || "не указано";
+  const subject = guessSubjectFromTitle(tender.title) || tender.title || "не указано";
+
+  const cargoSentences = pickSentences(summary, [
+    "груз",
+    "перевоз",
+    "достав",
+    "хранен",
+    "склад",
+    "паллет",
+    "позици",
+    "рейс",
+    "машин",
+    "транспорт",
+    "услуг",
+  ]);
+
+  const routeSentences = pickSentences(summary, [
+    "маршрут",
+    "адрес",
+    "москва",
+    "санкт",
+    "город",
+    "регион",
+    "склад",
+    "офис",
+    "доставка",
+    "забор",
+  ]);
+
+  const requirementSentences = pickSentences(summary, [
+    "требован",
+    "исполнитель",
+    "обеспеч",
+    "транспорт",
+    "документ",
+    "sla",
+    "упаков",
+    "маркиров",
+    "страхов",
+    "погруз",
+    "разгруз",
+  ]);
+
+  const paymentSentences = pickSentences(summary, [
+    "оплат",
+    "постоплат",
+    "аванс",
+    "отсроч",
+    "руб",
+    "ндс",
+    "кп",
+    "коммерч",
+    "стоим",
+    "тариф",
+  ]);
+
+  const deadlineText = tender.deadline || "не указано";
+
+  return [
+    formatPreviewSection("Заказчик", customer),
+    formatPreviewSection("Предмет тендера", subject),
+    formatPreviewSection(
+      "Груз / услуги",
+      cargoSentences.length ? cargoSentences.join("<br>") : "не указано",
+    ),
+    formatPreviewSection(
+      "Маршруты / адреса",
+      routeSentences.length ? routeSentences.join("<br>") : "не указано",
+    ),
+    formatPreviewSection("Сроки", deadlineText),
+    formatPreviewSection(
+      "Требования",
+      requirementSentences.length ? requirementSentences.join("<br>") : "не указано",
+    ),
+    formatPreviewSection(
+      "Оплата / коммерческие условия",
+      paymentSentences.length ? paymentSentences.join("<br>") : "не указано",
+    ),
+    `<p><strong>Документы:</strong><br>${formatPreviewDocuments(tender.documents || [])}</p>`,
+    formatPreviewSection("Ссылка", getTenderSourceUrl(tender.sourceUrl)),
+  ].join("");
+}
+
+function buildPreviewToken() {
+  return `preview_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
+function makeDescriptionFromPreview({ previewHtml, uploadedDocuments = [] }) {
+  const docsHtml = uploadedDocuments.length
+    ? `<ul>${uploadedDocuments
+        .map((doc) => {
+          const name = htmlEscape(normalizeDocumentName(doc.name || doc.filename || "Документ"));
+          const url = htmlEscape(doc.yougileUrl || doc.url);
+          return `<li><a target="_blank" rel="noopener noreferrer" href="${url}">${name}</a></li>`;
+        })
+        .join("")}</ul>`
+    : "Документы не загружены.";
+
+  return [
+    previewHtml,
+    `<p><strong>Документы YouGile:</strong><br>${docsHtml}</p>`,
+  ].join("");
+}
+
+async function parseBidzaarTenderPage(url) {
+  let browser;
+
+  const jsonResponses = [];
+  const responseUrls = [];
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const page = await browser.newPage({
+      viewport: {
+        width: 1440,
+        height: 1200,
+      },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    });
+
+    page.on("response", async (response) => {
+      try {
+        const responseUrl = response.url();
+        const contentType = response.headers()["content-type"] || "";
+
+        const shouldTryJson =
+          contentType.includes("application/json") ||
+          responseUrl.includes("/api/") ||
+          responseUrl.includes("/graphql") ||
+          responseUrl.includes("process") ||
+          responseUrl.includes("procedure") ||
+          responseUrl.includes("tender");
+
+        if (!shouldTryJson) return;
+
+        const json = await response.json().catch(() => null);
+
+        if (!json) return;
+
+        responseUrls.push(responseUrl);
+
+        if (jsonResponses.length < 80) {
+          jsonResponses.push({
+            url: responseUrl,
+            json,
+          });
+        }
+      } catch {
+        // Пропускаем закрытые и не-JSON ответы.
+      }
+    });
+
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 90000,
+    });
+
+    await page.waitForLoadState("networkidle", {
+      timeout: 45000,
+    }).catch(() => null);
+
+    await page.waitForTimeout(7000);
+
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => null);
+
+    await page.waitForTimeout(3000);
+
+    const domData = await page.evaluate(() => {
+      const text = document.body?.innerText || "";
+
+      const pageTitle =
+        document.querySelector("h1")?.innerText?.trim() ||
+        document.querySelector("h2")?.innerText?.trim() ||
+        document.title?.trim() ||
+        "Bidzaar";
+
+      const anchors = Array.from(document.querySelectorAll("a"));
+
+      const documents = anchors
+        .map((a) => {
+          const href = a.href;
+          const name = (a.innerText || a.getAttribute("download") || "").trim();
+
+          return {
+            name,
+            url: href,
+          };
+        })
+        .filter((item) => {
+          if (!item.url) return false;
+
+          const lowerUrl = item.url.toLowerCase();
+          const lowerName = item.name.toLowerCase();
+
+          return (
+            lowerUrl.includes(".doc") ||
+            lowerUrl.includes(".docx") ||
+            lowerUrl.includes(".xls") ||
+            lowerUrl.includes(".xlsx") ||
+            lowerUrl.includes(".pdf") ||
+            lowerUrl.includes(".zip") ||
+            lowerUrl.includes("download") ||
+            lowerName.includes(".doc") ||
+            lowerName.includes(".docx") ||
+            lowerName.includes(".xls") ||
+            lowerName.includes(".xlsx") ||
+            lowerName.includes(".pdf") ||
+            lowerName.includes(".zip")
+          );
+        });
+
+      return {
+        pageTitle,
+        text,
+        documents,
+      };
+    });
+
+    const textTender = extractTenderFromText(domData.text, url);
+    const jsonTender = extractTenderFromJsonResponses(jsonResponses, url);
+
+    const title = buildFinalTitle({
+      pageTitle: domData.pageTitle,
+      jsonTitle: jsonTender.jsonTitle,
+      company: jsonTender.company,
+    });
+
+    const code = jsonTender.code || textTender.code || null;
+    const deadline = jsonTender.deadline || textTender.deadline || null;
+
+    const domDocuments = domData.documents.map((doc, index) => ({
+      name: normalizeDocumentName(
+        doc.name || getFilenameFromUrl(doc.url, `Документ ${index + 1}`),
+      ),
+      url: doc.url,
+    }));
+
+    const documents = [];
+    const seenDocs = new Set();
+
+    for (const doc of [...jsonTender.documents, ...domDocuments]) {
+      const key = `${doc.name}|${doc.url}`;
+
+      if (seenDocs.has(key)) continue;
+
+      seenDocs.add(key);
+      documents.push(doc);
+    }
+
+    const positionsCount =
+      jsonTender.positionsCount ||
+      textTender.positionsCount ||
+      documents.length ||
+      0;
+
+    const summary = domData.text
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 1600);
+
+    return {
+      title,
+      code,
+      deadline,
+      positionsCount,
+      summary,
+      documents,
+      sourceUrl: url,
+      diagnostics: {
+        pageTitle: domData.pageTitle,
+        extractedPageTitle: extractTitleFromPageTitle(domData.pageTitle),
+        jsonTitle: jsonTender.jsonTitle,
+        company: jsonTender.company,
+        jsonResponsesCount: jsonResponses.length,
+        responseUrlsCount: responseUrls.length,
+      },
+    };
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
+  }
+}
+
+function makeCompactParseResponse(tender) {
+  return {
+    ok: true,
+    version: APP_VERSION,
+    title: tender.title || null,
+    code: tender.code || null,
+    deadline: tender.deadline || null,
+    positionsCount: tender.positionsCount || 0,
+    documentsCount: tender.documents?.length || 0,
+    pageTitle: tender.diagnostics?.pageTitle || null,
+    jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
+  };
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    version: APP_VERSION,
+    service: "yougile-upload-proxy",
+    endpoints: [
+      "POST /parse-bidzaar",
+      "POST /parse-bidzaar-compact",
+      "POST /upload-by-url",
+      "POST /preview-tender-from-url",
+      "POST /create-tender-from-preview",
+      "POST /create-tender-from-url",
+    ],
+  });
+});
+
+app.post("/parse-bidzaar-compact", requireProxyKey, async (req, res) => {
+  try {
+    const { url } = req.body || {};
+
+    if (!url) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "url is required",
+      });
+    }
+
+    const tender = await parseBidzaarTenderPage(url);
+
+    return res.json(makeCompactParseResponse(tender));
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      version: APP_VERSION,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/parse-bidzaar", requireProxyKey, async (req, res) => {
+  try {
+    const { url } = req.body || {};
+
+    if (!url) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "url is required",
+      });
+    }
+
+    const tender = await parseBidzaarTenderPage(url);
+
+    return res.json({
+      ok: true,
+      version: APP_VERSION,
+      tender: {
+        title: tender.title,
+        code: tender.code,
+        deadline: tender.deadline,
+        positionsCount: tender.positionsCount,
+        documentsCount: tender.documents.length,
+      },
+      diagnostics: {
+        pageTitle: tender.diagnostics?.pageTitle || null,
+        extractedPageTitle: tender.diagnostics?.extractedPageTitle || null,
+        jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
+        company: tender.diagnostics?.company || null,
+        jsonTitle: tender.diagnostics?.jsonTitle || null,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      version: APP_VERSION,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/upload-by-url", requireProxyKey, async (req, res) => {
+  try {
+    const { url, urls } = req.body || {};
+
+    const items = Array.isArray(urls) ? urls : url ? [url] : [];
+
+    if (!items.length) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "url or urls is required",
+      });
+    }
+
+    let uploadedCount = 0;
+    let errorCount = 0;
+
+    for (const itemUrl of items) {
+      try {
+        await uploadTenderFileByUrl(itemUrl);
+        uploadedCount += 1;
+      } catch {
+        errorCount += 1;
+      }
+    }
+
+    return res.json({
+      ok: errorCount === 0,
+      version: APP_VERSION,
+      uploaded: uploadedCount,
+      errors: errorCount,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      version: APP_VERSION,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/preview-tender-from-url", requireProxyKey, async (req, res) => {
+  try {
+    const { url } = req.body || {};
+
+    if (!url) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "url is required",
+      });
+    }
+
+    const tender = await parseBidzaarTenderPage(url);
+    const previewHtml = buildTenderPreview(tender);
+    const previewToken = buildPreviewToken();
+
+    previewStore.set(previewToken, {
+      createdAt: Date.now(),
+      sourceUrl: url,
+      tender,
+      previewHtml,
+    });
+
+    return res.json({
+      ok: true,
+      version: APP_VERSION,
+      mode: "preview",
+      previewToken,
+      title: tender.title || "Тендер",
+      documents: {
+        total: tender.documents?.length || 0,
+        processed: 0,
+        warning:
+          tender.documents?.length > 0
+            ? "Документы найдены, но текущая версия preview извлекает данные со страницы и списка вложений. Для финальной выжимки по содержимому документов нужно дополнительно подключить парсинг DOCX/XLSX/PDF."
+            : null,
+      },
+      previewHtml,
+      question: "Создать карточку в YouGile?",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      version: APP_VERSION,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/create-tender-from-preview", requireProxyKey, async (req, res) => {
+  try {
+    const {
+      previewToken,
+      columnId: bodyColumnId,
+      taskType = "Город",
+      type,
+      assigned = [],
+      color,
+      confirmedPreview = false,
+    } = req.body || {};
+
+    if (!previewToken) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "previewToken is required",
+      });
+    }
+
+    if (!confirmedPreview) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "confirmedPreview=true is required",
+      });
+    }
+
+    const stored = previewStore.get(previewToken);
+
+    if (!stored) {
+      return res.status(404).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "Preview not found or expired",
+      });
+    }
+
+    const columnId = bodyColumnId || YOUGILE_COLUMN_ID;
+
+    if (!columnId) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error:
+          "columnId is required. Pass columnId in body or set YOUGILE_COLUMN_ID env.",
+      });
+    }
+
+    const { tender, previewHtml } = stored;
+
+    const uploadedDocuments = [];
+    let uploadErrorCount = 0;
+
+    for (const doc of tender.documents || []) {
+      try {
+        const uploaded = await uploadTenderFileByUrl(
+          doc.url,
+          normalizeDocumentName(doc.name),
+        );
+
+        uploadedDocuments.push(uploaded);
+      } catch {
+        uploadErrorCount += 1;
+      }
+    }
+
+    const finalTaskType = type || taskType || "Город";
+
+    const taskPayload = {
+      title: tender.title || "Тендер",
+      columnId,
+      description: makeDescriptionFromPreview({
+        previewHtml,
+        uploadedDocuments,
+      }),
+      stickers: makeStickers({
+        taskType: finalTaskType,
+        positionsCount: tender.positionsCount || uploadedDocuments.length || 0,
+      }),
+    };
+
+    const deadline = makeDeadline(tender.deadline);
+
+    if (deadline) {
+      taskPayload.deadline = deadline;
+    }
+
+    if (Array.isArray(assigned) && assigned.length) {
+      taskPayload.assigned = assigned;
+    }
+
+    if (color) {
+      taskPayload.color = color;
+    }
+
+    const createdTask = await createYouGileTask(taskPayload);
+    const createdTaskId = getCreatedTaskId(createdTask);
+
+    if (!createdTaskId) {
+      return res.status(500).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "Task created, but created task id was not found in YouGile response",
+      });
+    }
+
+    const fullTask = await getYouGileTaskByIdApi(createdTaskId);
+    const shortTask = makeShortTask(fullTask, {
+      id: createdTaskId,
+      title: taskPayload.title,
+    });
+
+    previewStore.delete(previewToken);
+
+    return res.json({
+      ok: true,
+      version: APP_VERSION,
+      task: shortTask,
+      documents: {
+        total: tender.documents?.length || 0,
+        uploaded: uploadedDocuments.length,
+        errors: uploadErrorCount,
+      },
+      usedColumnId: columnId,
+      actualColumnId: fullTask?.columnId || null,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      version: APP_VERSION,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/create-tender-from-url", requireProxyKey, async (req, res) => {
+  try {
+    const {
+      url,
+      columnId: bodyColumnId,
+      taskType = "Город",
+      type,
+      assigned = [],
+      color,
+      createMode,
+      confirmedPreview = false,
+    } = req.body || {};
+
+    if (!url) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "url is required",
+      });
+    }
+
+    if (createMode !== "final" && confirmedPreview !== true) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error:
+          "Direct creation is disabled. First call /preview-tender-from-url, then /create-tender-from-preview with confirmedPreview=true. For forced direct creation pass createMode='final' or confirmedPreview=true.",
+      });
+    }
+
+    const columnId = bodyColumnId || YOUGILE_COLUMN_ID;
+
+    if (!columnId) {
+      return res.status(400).json({
+        ok: false,
+        version: APP_VERSION,
+        error:
+          "columnId is required. Pass columnId in body or set YOUGILE_COLUMN_ID env.",
+      });
+    }
+
+    const tender = await parseBidzaarTenderPage(url);
+    const previewHtml = buildTenderPreview(tender);
+
+    const uploadedDocuments = [];
+    let uploadErrorCount = 0;
+
+    for (const doc of tender.documents || []) {
+      try {
+        const uploaded = await uploadTenderFileByUrl(
+          doc.url,
+          normalizeDocumentName(doc.name),
+        );
+
+        uploadedDocuments.push(uploaded);
+      } catch {
+        uploadErrorCount += 1;
+      }
+    }
+
+    const finalTaskType = type || taskType || "Город";
+    const title = tender.title || "Тендер Bidzaar";
+
+    const taskPayload = {
+      title,
+      columnId,
+      description: makeDescriptionFromPreview({
+        previewHtml,
+        uploadedDocuments,
+      }),
+      stickers: makeStickers({
+        taskType: finalTaskType,
+        positionsCount: tender.positionsCount || uploadedDocuments.length || 0,
+      }),
+    };
+
+    const deadline = makeDeadline(tender.deadline);
+
+    if (deadline) {
+      taskPayload.deadline = deadline;
+    }
+
+    if (Array.isArray(assigned) && assigned.length) {
+      taskPayload.assigned = assigned;
+    }
+
+    if (color) {
+      taskPayload.color = color;
+    }
+
+    const createdTask = await createYouGileTask(taskPayload);
+    const createdTaskId = getCreatedTaskId(createdTask);
+
+    if (!createdTaskId) {
+      return res.status(500).json({
+        ok: false,
+        version: APP_VERSION,
+        error: "Task created, but created task id was not found in YouGile response",
+      });
+    }
+
+    const fullTask = await getYouGileTaskByIdApi(createdTaskId);
+    const shortTask = makeShortTask(fullTask, {
+      id: createdTaskId,
+      title,
+    });
+
+    return res.json({
+      ok: true,
+      version: APP_VERSION,
+      task: shortTask,
+      tender: {
+        title: tender.title,
+        code: tender.code,
+        deadline: tender.deadline,
+        positionsCount: tender.positionsCount,
+      },
+      documents: {
+        total: tender.documents?.length || 0,
+        uploaded: uploadedDocuments.length,
+        errors: uploadErrorCount,
+      },
+      parser: {
+        jsonResponsesCount: tender.diagnostics?.jsonResponsesCount || 0,
+        pageTitle: tender.diagnostics?.pageTitle || null,
+        extractedPageTitle: tender.diagnostics?.extractedPageTitle || null,
+        company: tender.diagnostics?.company || null,
+      },
+      usedColumnId: columnId,
+      actualColumnId: fullTask?.columnId || null,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      version: APP_VERSION,
+      error: error.message,
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`YouGile proxy is running on port ${PORT}`);
+  console.log(`Version: ${APP_VERSION}`);
+});
